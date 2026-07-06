@@ -2528,7 +2528,7 @@ def manage_status_labels(
                     return {"success": False, "error": "status_data is required for create action"}
                 
                 data = status_data.model_dump(exclude_none=True)
-                status = client.statuslabels.create(**data)
+                status = client.status_labels.create(**data)
                 return {
                     "success": True,
                     "data": {
@@ -2542,7 +2542,7 @@ def manage_status_labels(
                 if not status_id:
                     return {"success": False, "error": "status_id is required for get action"}
                 
-                status = client.statuslabels.get(status_id)
+                status = client.status_labels.get(status_id)
                 return {"success": True, "data": status}
             
             elif action == "list":
@@ -2558,7 +2558,7 @@ def manage_status_labels(
                 if order:
                     params["order"] = order
                 
-                statuses = client.statuslabels.list(**params)
+                statuses = client.status_labels.list(**params)
                 return {"success": True, "data": statuses, "count": len(statuses)}
             
             elif action == "update":
@@ -2568,7 +2568,7 @@ def manage_status_labels(
                     return {"success": False, "error": "status_data is required for update action"}
                 
                 data = status_data.model_dump(exclude_none=True)
-                status = client.statuslabels.update(status_id, **data)
+                status = client.status_labels.update(status_id, **data)
                 return {
                     "success": True,
                     "data": status,
@@ -2579,7 +2579,7 @@ def manage_status_labels(
                 if not status_id:
                     return {"success": False, "error": "status_id is required for delete action"}
                 
-                client.statuslabels.delete(status_id)
+                client.status_labels.delete(status_id)
                 return {
                     "success": True,
                     "message": f"Status label {status_id} deleted successfully"
@@ -2913,14 +2913,20 @@ async def component_operations(
                 if note:
                     payload["note"] = note
                 
-                result = snipe.components.checkout(component_id, **payload)
+                # Use raw HTTP request since library doesn't implement checkout for components
+                result = snipe._request("POST", f"components/{component_id}/checkout", json=payload)
                 return {"success": True, "data": result}
             
             elif action == "checkin":
                 if not asset_id:
                     return {"success": False, "error": "asset_id is required for checkin"}
                 
-                result = snipe.components.checkin(component_id, asset_id)
+                payload = {"asset_id": asset_id}
+                if note:
+                    payload["note"] = note
+                
+                # Use raw HTTP request since library doesn't implement checkin for components
+                result = snipe._request("POST", f"components/{component_id}/checkin", json=payload)
                 return {"success": True, "data": result}
     
     except SnipeITException as e:
