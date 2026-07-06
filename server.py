@@ -3220,84 +3220,82 @@ async def fieldset_field_operations(
 
 
 # DISABLED: Groups endpoint not available in snipeit-python-api library
-# @mcp.tool()
-# async def manage_groups(
-#     action: Literal["create", "get", "list", "update", "delete"],
-#     group_id: Optional[int] = None,
-#     group_data: Optional[GroupData] = None,
-#     limit: Optional[int] = 50,
-#     offset: Optional[int] = 0,
-#     sort: Optional[str] = None,
-#     order: Optional[Literal["asc", "desc"]] = None
-# ) -> dict:
-#     """
-#     Manage Snipe-IT groups (user groups/permissions) with CRUD operations.
-#     
-#     This tool handles all basic group operations:
-#     - create: Create a new group (requires group_data with name)
-#     - get: Retrieve a single group by ID
-#     - list: List groups with optional pagination
-#     - update: Update an existing group (requires group_id and group_data)
-#     - delete: Delete a group (requires group_id)
-#     
-#     Returns:
-#         dict: Result of the operation including success status and data
-#     """
-#     try:
-#         with get_snipeit_client() as snipe:
-#             if action == "create":
-#                 if not group_data:
-#                     return {"success": False, "error": "group_data is required for create action"}
-#                 
-#                 payload = {k: v for k, v in group_data.model_dump().items() if v is not None}
-#                 result = snipe.Groups.create(**payload)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "get":
-#                 if not group_id:
-#                     return {"success": False, "error": "group_id is required for get action"}
-#                 
-#                 result = snipe.Groups.get(group_id)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "list":
-#                 params = {"limit": limit, "offset": offset}
-#                 if sort:
-#                     params["sort"] = sort
-#                 if order:
-#                     params["order"] = order
-#                 
-#                 result = snipe.Groups.get(**params)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "update":
-#                 if not group_id:
-#                     return {"success": False, "error": "group_id is required for update action"}
-#                 if not group_data:
-#                     return {"success": False, "error": "group_id is required for update action"}
-#                 if not group_data:
-#                     return {"success": False, "error": "group_data is required for update action"}
-#                 
-#                 payload = {k: v for k, v in group_data.model_dump().items() if v is not None}
-#                 result = snipe.Groups.update(group_id, **payload)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "delete":
-#                 if not group_id:
-#                     return {"success": False, "error": "group_id is required for delete action"}
-#                 
-#                 snipe.Groups.delete(group_id)
-#                 return {
-#                     "success": True,
-#                     "message": f"Group {group_id} deleted successfully"
-#                 }
-#     
-#     except SnipeITException as e:
-#         logger.error(f"Snipe-IT error in manage_groups: {e}")
-#         return {"success": False, "error": str(e)}
-#     except Exception as e:
-#         logger.error(f"Error in manage_groups: {e}", exc_info=True)
-#         return {"success": False, "error": f"Unexpected error: {str(e)}"}
+@mcp.tool()
+async def manage_groups(
+    action: Literal["create", "get", "list", "update", "delete"],
+    group_id: Optional[int] = None,
+    group_data: Optional[GroupData] = None,
+    limit: Optional[int] = 50,
+    offset: Optional[int] = 0,
+    sort: Optional[str] = None,
+    order: Optional[Literal["asc", "desc"]] = None
+) -> dict:
+    """
+    Manage Snipe-IT groups (user groups/permissions) with CRUD operations.
+    
+    This tool handles all basic group operations:
+    - create: Create a new group (requires group_data with name)
+    - get: Retrieve a single group by ID
+    - list: List groups with optional pagination
+    - update: Update an existing group (requires group_id and group_data)
+    - delete: Delete a group (requires group_id)
+    
+    Returns:
+        dict: Result of the operation including success status and data
+    """
+    try:
+        with get_snipeit_client() as snipe:
+            if action == "create":
+                if not group_data:
+                    return {"success": False, "error": "group_data is required for create action"}
+                
+                payload = {k: v for k, v in group_data.model_dump().items() if v is not None}
+                result = snipe._request("POST", "groups", json=payload)
+                return {"success": True, "data": result}
+            
+            elif action == "get":
+                if not group_id:
+                    return {"success": False, "error": "group_id is required for get action"}
+                
+                result = snipe._request("GET", f"groups/{group_id}")
+                return {"success": True, "data": result}
+            
+            elif action == "list":
+                params = {"limit": limit, "offset": offset}
+                if sort:
+                    params["sort"] = sort
+                if order:
+                    params["order"] = order
+                
+                result = snipe._request("GET", "groups", params=params)
+                return {"success": True, "data": result}
+            
+            elif action == "update":
+                if not group_id:
+                    return {"success": False, "error": "group_id is required for update action"}
+                if not group_data:
+                    return {"success": False, "error": "group_data is required for update action"}
+                
+                payload = {k: v for k, v in group_data.model_dump().items() if v is not None}
+                result = snipe._request("PUT", f"groups/{group_id}", json=payload)
+                return {"success": True, "data": result}
+            
+            elif action == "delete":
+                if not group_id:
+                    return {"success": False, "error": "group_id is required for delete action"}
+                
+                snipe._request("DELETE", f"groups/{group_id}")
+                return {
+                    "success": True,
+                    "message": f"Group {group_id} deleted successfully"
+                }
+    
+    except SnipeITException as e:
+        logger.error(f"Snipe-IT error in manage_groups: {e}")
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"Error in manage_groups: {e}", exc_info=True)
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
 
 @mcp.tool()
@@ -3433,226 +3431,222 @@ async def checkout_by_tag(
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
 
-# DISABLED: Depreciations endpoint not available in snipeit-python-api library
-# @mcp.tool()
-# async def manage_depreciations(
-#     action: Literal["create", "get", "list", "update", "delete"],
-#     depreciation_id: Optional[int] = None,
-#     depreciation_data: Optional[DepreciationData] = None,
-#     limit: Optional[int] = 50,
-#     offset: Optional[int] = 0,
-#     sort: Optional[str] = None,
-#     order: Optional[Literal["asc", "desc"]] = None
-# ) -> dict:
-#     """
-#     Manage Snipe-IT depreciations with CRUD operations.
-#     
-#     This tool handles all basic depreciation operations:
-#     - create: Create a new depreciation (requires depreciation_data with name and months)
-#     - get: Retrieve a single depreciation by ID
-#     - list: List depreciations with optional pagination
-#     - update: Update an existing depreciation (requires depreciation_id and depreciation_data)
-#     - delete: Delete a depreciation (requires depreciation_id)
-#     
-#     Returns:
-#         dict: Result of the operation including success status and data
-#     """
-#     try:
-#         with get_snipeit_client() as snipe:
-#             if action == "create":
-#                 if not depreciation_data:
-#                     return {"success": False, "error": "depreciation_data is required for create action"}
-#                 
-#                 payload = {k: v for k, v in depreciation_data.model_dump().items() if v is not None}
-#                 result = snipe.Depreciations.create(**payload)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "get":
-#                 if not depreciation_id:
-#                     return {"success": False, "error": "depreciation_id is required for get action"}
-#                 
-#                 result = snipe.Depreciations.get(depreciation_id)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "list":
-#                 params = {"limit": limit, "offset": offset}
-#                 if sort:
-#                     params["sort"] = sort
-#                 if order:
-#                     params["order"] = order
-#                 
-#                 result = snipe.Depreciations.get(**params)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "update":
-#                 if not depreciation_id:
-#                     return {"success": False, "error": "depreciation_id is required for update action"}
-#                 if not depreciation_data:
-#                     return {"success": False, "error": "depreciation_data is required for update action"}
-#                 
-#                 payload = {k: v for k, v in depreciation_data.model_dump().items() if v is not None}
-#                 result = snipe.Depreciations.update(depreciation_id, **payload)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "delete":
-#                 if not depreciation_id:
-#                     return {"success": False, "error": "depreciation_id is required for delete action"}
-#                 
-#                 snipe.Depreciations.delete(depreciation_id)
-#                 return {
-#                     "success": True,
-#                     "message": f"Depreciation {depreciation_id} deleted successfully"
-#                 }
-#     
-#     except SnipeITException as e:
-#         logger.error(f"Snipe-IT error in manage_depreciations: {e}")
-#         return {"success": False, "error": str(e)}
-#     except Exception as e:
-#         logger.error(f"Error in manage_depreciations: {e}", exc_info=True)
-#         return {"success": False, "error": f"Unexpected error: {str(e)}"}
+@mcp.tool()
+async def manage_depreciations(
+    action: Literal["create", "get", "list", "update", "delete"],
+    depreciation_id: Optional[int] = None,
+    depreciation_data: Optional[DepreciationData] = None,
+    limit: Optional[int] = 50,
+    offset: Optional[int] = 0,
+    sort: Optional[str] = None,
+    order: Optional[Literal["asc", "desc"]] = None
+) -> dict:
+    """
+    Manage Snipe-IT depreciations with CRUD operations.
+    
+    This tool handles all basic depreciation operations:
+    - create: Create a new depreciation (requires depreciation_data with name and months)
+    - get: Retrieve a single depreciation by ID
+    - list: List depreciations with optional pagination
+    - update: Update an existing depreciation (requires depreciation_id and depreciation_data)
+    - delete: Delete a depreciation (requires depreciation_id)
+    
+    Returns:
+        dict: Result of the operation including success status and data
+    """
+    try:
+        with get_snipeit_client() as snipe:
+            if action == "create":
+                if not depreciation_data:
+                    return {"success": False, "error": "depreciation_data is required for create action"}
+                
+                payload = {k: v for k, v in depreciation_data.model_dump().items() if v is not None}
+                result = snipe._request("POST", "depreciations", json=payload)
+                return {"success": True, "data": result}
+            
+            elif action == "get":
+                if not depreciation_id:
+                    return {"success": False, "error": "depreciation_id is required for get action"}
+                
+                result = snipe._request("GET", f"depreciations/{depreciation_id}")
+                return {"success": True, "data": result}
+            
+            elif action == "list":
+                params = {"limit": limit, "offset": offset}
+                if sort:
+                    params["sort"] = sort
+                if order:
+                    params["order"] = order
+                
+                result = snipe._request("GET", "depreciations", params=params)
+                return {"success": True, "data": result}
+            
+            elif action == "update":
+                if not depreciation_id:
+                    return {"success": False, "error": "depreciation_id is required for update action"}
+                if not depreciation_data:
+                    return {"success": False, "error": "depreciation_data is required for update action"}
+                
+                payload = {k: v for k, v in depreciation_data.model_dump().items() if v is not None}
+                result = snipe._request("PUT", f"depreciations/{depreciation_id}", json=payload)
+                return {"success": True, "data": result}
+            
+            elif action == "delete":
+                if not depreciation_id:
+                    return {"success": False, "error": "depreciation_id is required for delete action"}
+                
+                snipe._request("DELETE", f"depreciations/{depreciation_id}")
+                return {
+                    "success": True,
+                    "message": f"Depreciation {depreciation_id} deleted successfully"
+                }
+    
+    except SnipeITException as e:
+        logger.error(f"Snipe-IT error in manage_depreciations: {e}")
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"Error in manage_depreciations: {e}", exc_info=True)
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
 
-# DISABLED: Kits endpoint not available in snipeit-python-api library
-# @mcp.tool()
-# async def manage_kits(
-#     action: Literal["create", "get", "list", "update", "delete"],
-#     kit_id: Optional[int] = None,
-#     kit_data: Optional[KitData] = None,
-#     limit: Optional[int] = 50,
-#     offset: Optional[int] = 0
-# ) -> dict:
-#     """
-#     Manage Snipe-IT predefined kits with CRUD operations.
-#     
-#     This tool handles all basic kit operations:
-#     - create: Create a new kit (requires kit_data with name)
-#     - get: Retrieve a single kit by ID
-#     - list: List kits with optional pagination
-#     - update: Update an existing kit (requires kit_id and kit_data)
-#     - delete: Delete a kit (requires kit_id)
-#     
-#     Returns:
-#         dict: Result of the operation including success status and data
-#     """
-#     try:
-#         with get_snipeit_client() as snipe:
-#             if action == "create":
-#                 if not kit_data:
-#                     return {"success": False, "error": "kit_data is required for create action"}
-#                 
-#                 payload = {k: v for k, v in kit_data.model_dump().items() if v is not None}
-#                 result = snipe.Kits.create(**payload)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "get":
-#                 if not kit_id:
-#                     return {"success": False, "error": "kit_id is required for get action"}
-#                 
-#                 result = snipe.Kits.get(kit_id)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "list":
-#                 params = {"limit": limit, "offset": offset}
-#                 result = snipe.Kits.get(**params)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "update":
-#                 if not kit_id:
-#                     return {"success": False, "error": "kit_id is required for update action"}
-#                 if not kit_data:
-#                     return {"success": False, "error": "kit_data is required for update action"}
-#                 
-#                 payload = {k: v for k, v in kit_data.model_dump().items() if v is not None}
-#                 result = snipe.Kits.update(kit_id, **payload)
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "delete":
-#                 if not kit_id:
-#                     return {"success": False, "error": "kit_id is required for delete action"}
-#                 
-#                 snipe.Kits.delete(kit_id)
-#                 return {
-#                     "success": True,
-#                     "message": f"Kit {kit_id} deleted successfully"
-#                 }
-#     
-#     except SnipeITException as e:
-#         logger.error(f"Snipe-IT error in manage_kits: {e}")
-#         return {"success": False, "error": str(e)}
-#     except Exception as e:
-#         logger.error(f"Error in manage_kits: {e}", exc_info=True)
-#         return {"success": False, "error": f"Unexpected error: {str(e)}"}
+@mcp.tool()
+async def manage_kits(
+    action: Literal["create", "get", "list", "update", "delete"],
+    kit_id: Optional[int] = None,
+    kit_data: Optional[KitData] = None,
+    limit: Optional[int] = 50,
+    offset: Optional[int] = 0
+) -> dict:
+    """
+    Manage Snipe-IT predefined kits with CRUD operations.
+    
+    This tool handles all basic kit operations:
+    - create: Create a new kit (requires kit_data with name)
+    - get: Retrieve a single kit by ID
+    - list: List kits with optional pagination
+    - update: Update an existing kit (requires kit_id and kit_data)
+    - delete: Delete a kit (requires kit_id)
+    
+    Returns:
+        dict: Result of the operation including success status and data
+    """
+    try:
+        with get_snipeit_client() as snipe:
+            if action == "create":
+                if not kit_data:
+                    return {"success": False, "error": "kit_data is required for create action"}
+                
+                payload = {k: v for k, v in kit_data.model_dump().items() if v is not None}
+                result = snipe._request("POST", "kits", json=payload)
+                return {"success": True, "data": result}
+            
+            elif action == "get":
+                if not kit_id:
+                    return {"success": False, "error": "kit_id is required for get action"}
+                
+                result = snipe._request("GET", f"kits/{kit_id}")
+                return {"success": True, "data": result}
+            
+            elif action == "list":
+                params = {"limit": limit, "offset": offset}
+                result = snipe._request("GET", "kits", params=params)
+                return {"success": True, "data": result}
+            
+            elif action == "update":
+                if not kit_id:
+                    return {"success": False, "error": "kit_id is required for update action"}
+                if not kit_data:
+                    return {"success": False, "error": "kit_data is required for update action"}
+                
+                payload = {k: v for k, v in kit_data.model_dump().items() if v is not None}
+                result = snipe._request("PUT", f"kits/{kit_id}", json=payload)
+                return {"success": True, "data": result}
+            
+            elif action == "delete":
+                if not kit_id:
+                    return {"success": False, "error": "kit_id is required for delete action"}
+                
+                snipe._request("DELETE", f"kits/{kit_id}")
+                return {
+                    "success": True,
+                    "message": f"Kit {kit_id} deleted successfully"
+                }
+    
+    except SnipeITException as e:
+        logger.error(f"Snipe-IT error in manage_kits: {e}")
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"Error in manage_kits: {e}", exc_info=True)
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
 
-# DISABLED: Reports endpoint not available in snipeit-python-api library
-# @mcp.tool()
-# async def reports(
-#     action: Literal["activity", "depreciation"]
-# ) -> dict:
-#     """
-#     Generate Snipe-IT reports.
-#     
-#     Operations:
-#     - activity: Get activity report
-#     - depreciation: Get depreciation report
-#     
-#     Returns:
-#         dict: Result of the operation including success status and data
-#     """
-#     try:
-#         with get_snipeit_client() as snipe:
-#             if action == "activity":
-#                 result = snipe.Reports.get_activity()
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "depreciation":
-#                 result = snipe.Reports.get_depreciation()
-#                 return {"success": True, "data": result}
-#     
-#     except SnipeITException as e:
-#         logger.error(f"Snipe-IT error in reports: {e}")
-#         return {"success": False, "error": str(e)}
-#     except Exception as e:
-#         logger.error(f"Error in reports: {e}", exc_info=True)
-#         return {"success": False, "error": f"Unexpected error: {str(e)}"}
+@mcp.tool()
+async def reports(
+    action: Literal["activity", "depreciation"]
+) -> dict:
+    """
+    Generate Snipe-IT reports.
+    
+    Operations:
+    - activity: Get activity report
+    - depreciation: Get depreciation report
+    
+    Returns:
+        dict: Result of the operation including success status and data
+    """
+    try:
+        with get_snipeit_client() as snipe:
+            if action == "activity":
+                result = snipe._request("GET", "reports/activity")
+                return {"success": True, "data": result}
+            
+            elif action == "depreciation":
+                result = snipe._request("GET", "reports/depreciation")
+                return {"success": True, "data": result}
+    
+    except SnipeITException as e:
+        logger.error(f"Snipe-IT error in reports: {e}")
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"Error in reports: {e}", exc_info=True)
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
 
-# DISABLED: Settings endpoint not available in snipeit-python-api library
-# @mcp.tool()
-# async def system_settings(
-#     action: Literal["get_settings", "ldap_test", "backup_list"]
-# ) -> dict:
-#     """
-#     Access Snipe-IT system settings and utilities.
-#     
-#     Operations:
-#     - get_settings: Get system settings
-#     - ldap_test: Test LDAP connection
-#     - backup_list: List available backups
-#     
-#     Returns:
-#         dict: Result of the operation including success status and data
-#     """
-#     try:
-#         with get_snipeit_client() as snipe:
-#             if action == "get_settings":
-#                 result = snipe.Settings.get()
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "ldap_test":
-#                 result = snipe.Settings.ldap_test()
-#                 return {"success": True, "data": result}
-#             
-#             elif action == "backup_list":
-#                 result = snipe.Settings.list_backups()
-#                 return {"success": True, "data": result}
-#     
-#     except SnipeITException as e:
-#         logger.error(f"Snipe-IT error in system_settings: {e}")
-#         return {"success": False, "error": str(e)}
-#     except Exception as e:
-#         logger.error(f"Error in system_settings: {e}", exc_info=True)
-#         return {"success": False, "error": f"Unexpected error: {str(e)}"}
+@mcp.tool()
+async def system_settings(
+    action: Literal["get_settings", "ldap_test", "backup_list"]
+) -> dict:
+    """
+    Access Snipe-IT system settings and utilities.
+    
+    Operations:
+    - get_settings: Get system settings
+    - ldap_test: Test LDAP connection
+    - backup_list: List available backups
+    
+    Returns:
+        dict: Result of the operation including success status and data
+    """
+    try:
+        with get_snipeit_client() as snipe:
+            if action == "get_settings":
+                result = snipe._request("GET", "settings")
+                return {"success": True, "data": result}
+            
+            elif action == "ldap_test":
+                result = snipe._request("GET", "settings/ldaptest")
+                return {"success": True, "data": result}
+            
+            elif action == "backup_list":
+                result = snipe._request("GET", "settings/backups")
+                return {"success": True, "data": result}
+    
+    except SnipeITException as e:
+        logger.error(f"Snipe-IT error in system_settings: {e}")
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        logger.error(f"Error in system_settings: {e}", exc_info=True)
+        return {"success": False, "error": f"Unexpected error: {str(e)}"}
 
 
 # ============================================================================
