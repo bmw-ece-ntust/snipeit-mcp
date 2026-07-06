@@ -2849,7 +2849,7 @@ async def manage_components(
                 if order:
                     params["order"] = order
                 
-                result = snipe.components.get(**params)
+                result = snipe.components.list(**params)
                 return {"success": True, "data": result}
             
             elif action == "update":
