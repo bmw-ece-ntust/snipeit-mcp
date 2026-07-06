@@ -2266,6 +2266,7 @@ dependencies = [
     { name = "paddlepaddle" },
     { name = "pillow" },
     { name = "pyclipper" },
+    { name = "pydantic" },
     { name = "requests" },
     { name = "shapely" },
     { name = "snipeit-api" },
@@ -2282,6 +2283,7 @@ requires-dist = [
     { name = "paddlepaddle", specifier = ">=2.5.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pyclipper", specifier = ">=1.3.0" },
+    { name = "pydantic", specifier = ">=2.0.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "shapely", specifier = ">=2.0.0" },
     { name = "snipeit-api", git = "https://github.com/lfctech/snipeit-python-api.git?rev=main" },
@@ -2456,8 +2458,8 @@ name = "uvicorn"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "h11" },
+    { name = "click", marker = "sys_platform != 'emscripten'" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/71/57/1616c8274c3442d802621abf5deb230771c7a0fec9414cb6763900eb3868/uvicorn-0.37.0.tar.gz", hash = "sha256:4115c8add6d3fd536c8ee77f0e14a7fd2ebba939fed9b02583a97f80648f9e13", size = 80367, upload-time = "2025-09-23T13:33:47.486Z" }
 wheels = [
