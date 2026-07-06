@@ -6,7 +6,16 @@ requires-python = ">=3.11"
 dependencies = [
     "fastmcp>=2.0.0",
     "requests>=2.31.0",
-    "snipeit-api @ file:///Users/work/Documents/Projects/Inventory/snipeit-python-api",
+    "snipeit-api @ git+https://github.com/lfctech/snipeit-python-api.git@main",
+    "paddleocr>=2.7.0",
+    "paddlepaddle>=2.5.0",
+    "opencv-python>=4.8.0",
+    "pillow>=10.0.0",
+    "shapely>=2.0.0",
+    "pyclipper>=1.3.0",
+    "lmdb>=1.4.0",
+    "tqdm>=4.66.0",
+    "numpy>=1.24.0",
 ]
 
 [tool.uv]

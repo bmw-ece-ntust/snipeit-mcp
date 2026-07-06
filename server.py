@@ -6,7 +6,9 @@ Provides tools for CRUD operations on Assets and Consumables.
 
 import os
 import logging
+import re
 from typing import Literal, Annotated, Any
+from pathlib import Path
 from pydantic import BaseModel, Field
 
 from fastmcp import FastMCP
@@ -17,6 +19,15 @@ from snipeit.exceptions import (
     SnipeITAuthenticationError,
     SnipeITValidationError
 )
+
+# OCR imports (lazy-loaded to avoid startup failures if not installed)
+try:
+    from paddleocr import PaddleOCR
+    from PIL import Image
+    PADDLEOCR_AVAILABLE = True
+except ImportError:
+    PADDLEOCR_AVAILABLE = False
+    logger.warning("PaddleOCR not available. Label extraction tools will not work.")
 
 # Configure logging
 logging.basicConfig(
@@ -126,6 +137,179 @@ class ConsumableData(BaseModel):
     purchase_cost: float | None = Field(None, description="Purchase cost")
     min_amt: int | None = Field(None, description="Minimum quantity threshold")
     notes: str | None = Field(None, description="Additional notes")
+
+
+class LabelFieldMapping(BaseModel):
+    """Model for configurable Chinese field names on NTUST labels."""
+    asset_number: str = Field("財產編號", description="Asset number field name")
+    acquisition_date: str = Field("取得日期", description="Acquisition date field name")
+    serial_number: str = Field("序號", description="Serial number field name")
+    lifespan: str = Field("年限", description="Lifespan field name")
+    asset_name: str = Field("財產名稱", description="Asset name field name")
+    custodian_unit: str = Field("保管單位", description="Custodian unit field name")
+    custodian: str = Field("保管人員", description="Custodian field name")
+    specs: str = Field("規格", description="Specifications field name")
+    funding_source: str = Field("經費來源", description="Funding source field name")
+
+
+class ExtractedLabelData(BaseModel):
+    """Model for extracted label data from OCR."""
+    asset_tag: str | None = Field(None, description="Extracted asset tag (財產編號)")
+    serial: str | None = Field(None, description="Extracted serial number (序號)")
+    name: str | None = Field(None, description="Extracted asset name (財產名稱)")
+    purchase_date: str | None = Field(None, description="Extracted purchase date in YYYY-MM-DD format")
+    warranty_months: int | None = Field(None, description="Extracted lifespan in months")
+    specs: str | None = Field(None, description="Extracted specifications (規格)")
+    custodian_unit: str | None = Field(None, description="Extracted custodian unit (保管單位)")
+    custodian: str | None = Field(None, description="Extracted custodian name (保管人員)")
+    funding_source: str | None = Field(None, description="Extracted funding source (經費來源)")
+    raw_ocr_text: str = Field(..., description="Full OCR text for debugging")
+    confidence: float | None = Field(None, description="Average OCR confidence score")
+
+
+# ============================================================================
+# Helper Functions for Label Extraction
+# ============================================================================
+
+def convert_roc_to_gregorian(roc_date: str) -> str | None:
+    """
+    Convert ROC (Republic of China) date to Gregorian date.
+    
+    ROC year + 1911 = Gregorian year
+    Example: 107.07.06 -> 2018-07-06
+    
+    Args:
+        roc_date: ROC date string (e.g., "107.07.06", "107-07-06", "107/07/06")
+        
+    Returns:
+        Gregorian date in YYYY-MM-DD format, or None if parsing fails
+    """
+    try:
+        # Remove whitespace
+        roc_date = roc_date.strip()
+        
+        # Support multiple separators: . - /
+        parts = re.split(r'[.\-/]', roc_date)
+        if len(parts) != 3:
+            logger.warning(f"Invalid ROC date format: {roc_date}")
+            return None
+        
+        roc_year, month, day = parts
+        
+        # Convert to integers
+        roc_year_int = int(roc_year)
+        month_int = int(month)
+        day_int = int(day)
+        
+        # Convert ROC year to Gregorian
+        gregorian_year = roc_year_int + 1911
+        
+        # Format as YYYY-MM-DD
+        return f"{gregorian_year:04d}-{month_int:02d}-{day_int:02d}"
+        
+    except (ValueError, IndexError) as e:
+        logger.warning(f"Failed to convert ROC date '{roc_date}': {e}")
+        return None
+
+
+def extract_field_value(ocr_text: str, field_name: str) -> str | None:
+    """
+    Extract value after a field name from OCR text.
+    
+    Looks for patterns like:
+    - "財產編號: 3140101-03"
+    - "財產編號：3140101-03" (full-width colon)
+    - "財產編號 3140101-03" (space separator)
+    
+    Args:
+        ocr_text: Full OCR text
+        field_name: Chinese field name to search for
+        
+    Returns:
+        Extracted value or None if not found
+    """
+    # Try multiple patterns
+    patterns = [
+        rf"{re.escape(field_name)}\s*[:：]\s*([^\n]+)",  # with colon
+        rf"{re.escape(field_name)}\s+([^\n]+)",  # with space
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, ocr_text)
+        if match:
+            value = match.group(1).strip()
+            # Remove common noise characters
+            value = re.sub(r'[|]', '', value)
+            return value if value else None
+    
+    return None
+
+
+def parse_label_fields(ocr_text: str, field_mapping: LabelFieldMapping) -> dict[str, Any]:
+    """
+    Parse all fields from OCR text using field mapping.
+    
+    Args:
+        ocr_text: Full OCR text from label
+        field_mapping: Field name mapping for Chinese labels
+        
+    Returns:
+        Dictionary of extracted fields
+    """
+    extracted = {}
+    
+    # Extract asset tag (財產編號)
+    asset_tag = extract_field_value(ocr_text, field_mapping.asset_number)
+    if asset_tag:
+        extracted["asset_tag"] = asset_tag
+    
+    # Extract serial number (序號)
+    serial = extract_field_value(ocr_text, field_mapping.serial_number)
+    if serial:
+        extracted["serial"] = serial
+    
+    # Extract asset name (財產名稱)
+    name = extract_field_value(ocr_text, field_mapping.asset_name)
+    if name:
+        extracted["name"] = name
+    
+    # Extract acquisition date (取得日期) and convert ROC to Gregorian
+    roc_date = extract_field_value(ocr_text, field_mapping.acquisition_date)
+    if roc_date:
+        gregorian_date = convert_roc_to_gregorian(roc_date)
+        if gregorian_date:
+            extracted["purchase_date"] = gregorian_date
+    
+    # Extract lifespan (年限) and convert years to months
+    lifespan = extract_field_value(ocr_text, field_mapping.lifespan)
+    if lifespan:
+        try:
+            years = int(re.search(r'\d+', lifespan).group())
+            extracted["warranty_months"] = years * 12
+        except (AttributeError, ValueError):
+            logger.warning(f"Failed to parse lifespan: {lifespan}")
+    
+    # Extract specs (規格)
+    specs = extract_field_value(ocr_text, field_mapping.specs)
+    if specs:
+        extracted["specs"] = specs
+    
+    # Extract custodian unit (保管單位)
+    custodian_unit = extract_field_value(ocr_text, field_mapping.custodian_unit)
+    if custodian_unit:
+        extracted["custodian_unit"] = custodian_unit
+    
+    # Extract custodian (保管人員)
+    custodian = extract_field_value(ocr_text, field_mapping.custodian)
+    if custodian:
+        extracted["custodian"] = custodian
+    
+    # Extract funding source (經費來源)
+    funding_source = extract_field_value(ocr_text, field_mapping.funding_source)
+    if funding_source:
+        extracted["funding_source"] = funding_source
+    
+    return extracted
 
 
 # ============================================================================
@@ -878,6 +1062,381 @@ def manage_consumables(
     except Exception as e:
         logger.error(f"Unexpected error in manage_consumables: {e}", exc_info=True)
         return {"success": False, "error": f"Unexpected error: {str(e)}"}
+
+
+# ============================================================================
+# Label Extraction Tools
+# ============================================================================
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
+)
+def extract_label_data(
+    image_path: Annotated[str, "Path to the label image file"],
+    language: Annotated[str, "OCR language code (default: chinese_cht for Traditional Chinese)"] = "chinese_cht",
+    field_mapping: Annotated[LabelFieldMapping | None, "Custom field name mapping for labels"] = None,
+) -> dict[str, Any]:
+    """Extract asset data from NTUST label photos using OCR.
+    
+    Uses PaddleOCR to extract text from Traditional Chinese labels and parse
+    structured asset information including asset tag, serial number, purchase date,
+    and other fields.
+    
+    Supports ROC (Republic of China) date conversion to Gregorian dates.
+    
+    Args:
+        image_path: Path to the label image file (JPEG, PNG, etc.)
+        language: OCR language code (default: "chinese_cht" for Traditional Chinese)
+        field_mapping: Optional custom field names (defaults to NTUST standard fields)
+    
+    Returns:
+        dict: Extracted label data with asset_tag, serial, name, purchase_date, etc.
+    """
+    if not PADDLEOCR_AVAILABLE:
+        return {
+            "success": False,
+            "error": "PaddleOCR is not installed. Install dependencies with: uv sync"
+        }
+    
+    try:
+        # Validate image path
+        image_file = Path(image_path)
+        if not image_file.exists():
+            return {"success": False, "error": f"Image file not found: {image_path}"}
+        
+        if not image_file.is_file():
+            return {"success": False, "error": f"Path is not a file: {image_path}"}
+        
+        # Use default NTUST field mapping if not provided
+        if field_mapping is None:
+            field_mapping = LabelFieldMapping()
+        
+        logger.info(f"Initializing PaddleOCR with language: {language}")
+        
+        # Initialize PaddleOCR (use_angle_cls=True for better rotated text detection)
+        ocr = PaddleOCR(
+            use_angle_cls=True,
+            lang=language,
+            use_gpu=False,  # CPU-only for compatibility
+            show_log=False
+        )
+        
+        # Run OCR
+        logger.info(f"Running OCR on image: {image_path}")
+        result = ocr.ocr(str(image_file), cls=True)
+        
+        if not result or not result[0]:
+            return {
+                "success": False,
+                "error": "No text detected in image"
+            }
+        
+        # Extract text and confidence scores
+        ocr_lines = []
+        confidence_scores = []
+        
+        for line in result[0]:
+            text = line[1][0]  # Extract text
+            confidence = line[1][1]  # Extract confidence score
+            ocr_lines.append(text)
+            confidence_scores.append(confidence)
+        
+        # Combine all OCR text
+        full_ocr_text = "\n".join(ocr_lines)
+        avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
+        
+        logger.info(f"OCR completed. Detected {len(ocr_lines)} lines with avg confidence: {avg_confidence:.2f}")
+        
+        # Parse fields from OCR text
+        extracted_fields = parse_label_fields(full_ocr_text, field_mapping)
+        
+        # Build response
+        extracted_data = ExtractedLabelData(
+            asset_tag=extracted_fields.get("asset_tag"),
+            serial=extracted_fields.get("serial"),
+            name=extracted_fields.get("name"),
+            purchase_date=extracted_fields.get("purchase_date"),
+            warranty_months=extracted_fields.get("warranty_months"),
+            specs=extracted_fields.get("specs"),
+            custodian_unit=extracted_fields.get("custodian_unit"),
+            custodian=extracted_fields.get("custodian"),
+            funding_source=extracted_fields.get("funding_source"),
+            raw_ocr_text=full_ocr_text,
+            confidence=round(avg_confidence, 3)
+        )
+        
+        return {
+            "success": True,
+            "extracted_data": extracted_data.model_dump(),
+            "ocr_lines_count": len(ocr_lines)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in extract_label_data: {e}", exc_info=True)
+        return {"success": False, "error": f"OCR extraction failed: {str(e)}"}
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+    }
+)
+def import_asset_from_label(
+    image_path: Annotated[str, "Path to the label image file"],
+    status_id: Annotated[int, "Status label ID (required for asset creation)"],
+    model_id: Annotated[int, "Asset model ID (required for asset creation)"],
+    location_id: Annotated[int | None, "Location ID (optional)"] = None,
+    language: Annotated[str, "OCR language code"] = "chinese_cht",
+    field_mapping: Annotated[LabelFieldMapping | None, "Custom field name mapping"] = None,
+    preview_only: Annotated[bool, "If True, extract data without creating asset"] = False,
+) -> dict[str, Any]:
+    """Extract label data and create asset in Snipe-IT in one step.
+    
+    This workflow tool combines OCR extraction with asset creation. Use preview_only=True
+    to review extracted data before committing to asset creation.
+    
+    Args:
+        image_path: Path to the label image file
+        status_id: Status label ID (required, e.g., 2 for "Ready to Deploy")
+        model_id: Asset model ID (required)
+        location_id: Location ID (optional)
+        language: OCR language code (default: "chinese_cht")
+        field_mapping: Custom field name mapping (optional)
+        preview_only: If True, only extract and return data without creating asset
+    
+    Returns:
+        dict: Extraction result and asset creation result (if preview_only=False)
+    """
+    try:
+        # Step 1: Extract label data
+        extraction_result = extract_label_data(
+            image_path=image_path,
+            language=language,
+            field_mapping=field_mapping
+        )
+        
+        if not extraction_result.get("success"):
+            return extraction_result
+        
+        extracted_data = extraction_result["extracted_data"]
+        
+        # If preview only, return extracted data
+        if preview_only:
+            return {
+                "success": True,
+                "preview_mode": True,
+                "extracted_data": extracted_data,
+                "message": "Data extracted successfully. Set preview_only=False to create asset."
+            }
+        
+        # Step 2: Create asset from extracted data
+        asset_data = AssetData(
+            status_id=status_id,
+            model_id=model_id,
+            asset_tag=extracted_data.get("asset_tag"),
+            name=extracted_data.get("name"),
+            serial=extracted_data.get("serial"),
+            purchase_date=extracted_data.get("purchase_date"),
+            warranty_months=extracted_data.get("warranty_months"),
+            location_id=location_id,
+            notes=f"Imported from label. Specs: {extracted_data.get('specs', 'N/A')}\n"
+                  f"Custodian Unit: {extracted_data.get('custodian_unit', 'N/A')}\n"
+                  f"Custodian: {extracted_data.get('custodian', 'N/A')}\n"
+                  f"Funding: {extracted_data.get('funding_source', 'N/A')}"
+        )
+        
+        # Create asset using existing manage_assets tool logic
+        client = get_snipeit_client()
+        
+        with client:
+            # Build creation payload (only include non-None values)
+            create_kwargs = {k: v for k, v in asset_data.model_dump().items() if v is not None}
+            asset = client.hardware.create(**create_kwargs)
+            
+            return {
+                "success": True,
+                "extracted_data": extracted_data,
+                "asset": {
+                    "id": asset.id,
+                    "asset_tag": getattr(asset, "asset_tag", None),
+                    "name": getattr(asset, "name", None),
+                    "serial": getattr(asset, "serial", None),
+                },
+                "message": f"Asset created successfully with ID: {asset.id}"
+            }
+    
+    except SnipeITValidationError as e:
+        logger.error(f"Validation error: {e}")
+        return {
+            "success": False,
+            "error": f"Asset creation failed: {str(e)}",
+            "extracted_data": extraction_result.get("extracted_data") if extraction_result.get("success") else None
+        }
+    except SnipeITException as e:
+        logger.error(f"Snipe-IT error: {e}")
+        return {
+            "success": False,
+            "error": f"Snipe-IT error: {str(e)}",
+            "extracted_data": extraction_result.get("extracted_data") if extraction_result.get("success") else None
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error in import_asset_from_label: {e}", exc_info=True)
+        return {"success": False, "error": f"Import failed: {str(e)}"}
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+    }
+)
+def batch_import_labels(
+    image_paths: Annotated[list[str], "List of paths to label image files"],
+    status_id: Annotated[int, "Status label ID for all assets"],
+    model_id: Annotated[int, "Asset model ID for all assets"],
+    location_id: Annotated[int | None, "Location ID for all assets (optional)"] = None,
+    language: Annotated[str, "OCR language code"] = "chinese_cht",
+    stop_on_error: Annotated[bool, "Stop processing on first error"] = False,
+) -> dict[str, Any]:
+    """Batch import multiple assets from label images.
+    
+    Processes multiple label images and creates assets for each one. Returns
+    summary of successes and failures.
+    
+    Args:
+        image_paths: List of paths to label image files
+        status_id: Status label ID for all assets
+        model_id: Asset model ID for all assets
+        location_id: Location ID for all assets (optional)
+        language: OCR language code (default: "chinese_cht")
+        stop_on_error: If True, stop processing on first error
+    
+    Returns:
+        dict: Summary with success_count, failure_count, and detailed results
+    """
+    results = []
+    success_count = 0
+    failure_count = 0
+    
+    for i, image_path in enumerate(image_paths, 1):
+        logger.info(f"Processing label {i}/{len(image_paths)}: {image_path}")
+        
+        result = import_asset_from_label(
+            image_path=image_path,
+            status_id=status_id,
+            model_id=model_id,
+            location_id=location_id,
+            language=language,
+            preview_only=False
+        )
+        
+        if result.get("success"):
+            success_count += 1
+        else:
+            failure_count += 1
+            if stop_on_error:
+                logger.warning(f"Stopping batch import due to error on image {i}")
+                break
+        
+        results.append({
+            "image_path": image_path,
+            "index": i,
+            "result": result
+        })
+    
+    return {
+        "success": True,
+        "total": len(image_paths),
+        "processed": len(results),
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "results": results
+    }
+
+
+@mcp.tool(
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+    }
+)
+def get_asset_qr_code(
+    asset_id: Annotated[int | None, "Asset ID"] = None,
+    asset_tag: Annotated[str | None, "Asset tag"] = None,
+    save_path: Annotated[str, "Path to save the QR code image"] = "/tmp/qr_code.png",
+    code_type: Annotated[Literal["qr", "barcode"], "Type of code to generate"] = "qr",
+) -> dict[str, Any]:
+    """Get individual QR code or barcode image for an asset.
+    
+    Fetches the QR code (2D) or barcode (1D) PNG image from Snipe-IT and saves it
+    to the specified path. This is separate from PDF label generation.
+    
+    Args:
+        asset_id: Asset ID (provide either asset_id or asset_tag)
+        asset_tag: Asset tag (provide either asset_id or asset_tag)
+        save_path: Path to save the image file
+        code_type: "qr" for 2D QR code, "barcode" for 1D barcode
+    
+    Returns:
+        dict: Success status and path to saved image
+    """
+    try:
+        if not asset_id and not asset_tag:
+            return {"success": False, "error": "Either asset_id or asset_tag must be provided"}
+        
+        client = get_snipeit_client()
+        
+        # If asset_tag provided, get asset_id first
+        if asset_tag and not asset_id:
+            with client:
+                assets = client.hardware.list(search=asset_tag, limit=1)
+                if not assets:
+                    return {"success": False, "error": f"Asset not found with tag: {asset_tag}"}
+                asset_id = assets[0].id
+        
+        # Build URL based on code type
+        if code_type == "qr":
+            url = f"{SNIPEIT_URL}/hardware/{asset_id}/qr_code"
+        else:  # barcode
+            url = f"{SNIPEIT_URL}/hardware/{asset_id}/barcode"
+        
+        # Fetch image
+        import requests
+        headers = {
+            "Authorization": f"Bearer {SNIPEIT_TOKEN}",
+            "Accept": "image/png"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        
+        # Save image
+        output_path = Path(save_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(response.content)
+        
+        return {
+            "success": True,
+            "asset_id": asset_id,
+            "code_type": code_type,
+            "saved_to": str(output_path),
+            "file_size": len(response.content)
+        }
+    
+    except requests.HTTPError as e:
+        logger.error(f"HTTP error fetching {code_type}: {e}")
+        return {"success": False, "error": f"Failed to fetch {code_type}: {str(e)}"}
+    except Exception as e:
+        logger.error(f"Error in get_asset_qr_code: {e}", exc_info=True)
+        return {"success": False, "error": f"Failed to get {code_type}: {str(e)}"}
 
 
 # ============================================================================

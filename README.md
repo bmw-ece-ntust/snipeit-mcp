@@ -8,9 +8,12 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for ma
 - **Asset Operations**: Checkout, checkin, audit, and restore assets
 - **File Management**: Upload, download, list, and delete asset attachments
 - **Label Generation**: Generate printable PDF labels for assets
+- **OCR Label Extraction**: Extract asset data from NTUST label photos using Traditional Chinese OCR
+- **QR Code Generation**: Generate individual QR code and barcode images for assets
 - **Maintenance Tracking**: Create maintenance records for assets
 - **License Management**: View licenses associated with assets
 - **Consumable Management**: Full CRUD operations for consumables
+- **ROC Date Conversion**: Automatic conversion of ROC (Republic of China) dates to Gregorian
 - **Type-Safe**: Built with Pydantic models for robust validation
 - **Error Handling**: Comprehensive error handling and logging
 
@@ -20,6 +23,7 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for ma
 - [UV](https://github.com/astral-sh/uv) package manager
 - A running Snipe-IT instance with API access
 - Snipe-IT API token with appropriate permissions
+- **For OCR features**: OpenCV system libraries (install with `brew install opencv` on macOS)
 
 ## Installation
 
@@ -42,17 +46,11 @@ uv sync
 # - Set up the project for development
 ```
 
-**Note:** The first time you run `uv sync`, it will install the snipeit-python-api from the local path at `/Users/work/Documents/Projects/Inventory/snipeit-python-api`. Make sure that directory exists.
-
-Alternatively, if you want to manually set up:
-
-```bash
-# Create virtual environment
-uv venv --python 3.11
-
-# Install dependencies
-uv pip install fastmcp requests /Users/work/Documents/Projects/Inventory/snipeit-python-api
-```
+**Note:** The `uv sync` command will install all dependencies including:
+- FastMCP framework
+- Snipe-IT Python API client (from GitHub)
+- PaddleOCR and dependencies for OCR label extraction
+- Pydantic for data validation
 
 ### 3. Configure environment variables
 
@@ -281,6 +279,163 @@ Comprehensive consumable management with CRUD operations.
 }
 ```
 
+#### 8. `extract_label_data`
+Extract asset data from NTUST (or other) label photos using OCR.
+
+**Features:**
+- Traditional Chinese OCR support using PaddleOCR
+- Automatic ROC date conversion (民國年) to Gregorian dates
+- Configurable field mappings for different label formats
+- Returns structured data with confidence scores
+
+**Parameters:**
+- `image_path`: Path to the label photo
+- `language`: OCR language (default: `chinese_cht` for Traditional Chinese)
+- `field_mapping`: Optional custom field names (defaults to NTUST format)
+
+**Default NTUST Field Mapping:**
+- 財產編號 → asset_tag
+- 取得日期 → purchase_date (auto-converts ROC dates)
+- 序號 → serial
+- 年限 → warranty_months (converts years to months)
+- 財產名稱 → name
+- 保管單位 → custodian_unit
+- 保管人員 → custodian
+- 規格 → specs
+- 經費來源 → funding_source
+
+**Example:**
+```python
+# Extract data from NTUST label
+{
+    "image_path": "/path/to/label_photo.jpg",
+    "language": "chinese_cht"
+}
+
+# Returns:
+{
+    "success": true,
+    "extracted_data": {
+        "asset_tag": "3140101-03",
+        "serial": "0231X2",
+        "name": "主機含螢幕23吋+",
+        "purchase_date": "2018-07-06",  # Converted from ROC 107.07.06
+        "warranty_months": 48,  # Converted from 4 years
+        "specs": "ASUSMD590",
+        "custodian_unit": "電子系",
+        "custodian": "鄭瑞光",
+        "funding_source": "校務基金",
+        "raw_ocr_text": "...",
+        "confidence": 0.95
+    }
+}
+```
+
+#### 9. `import_asset_from_label`
+One-step workflow: extract label data and create asset in Snipe-IT.
+
+**Features:**
+- Combines OCR extraction with asset creation
+- Preview mode to review data before creating
+- Automatically builds notes field with specs, custodian, and funding info
+
+**Parameters:**
+- `image_path`: Path to the label photo
+- `status_id`: Required Snipe-IT status ID for the asset
+- `model_id`: Required Snipe-IT model ID for the asset
+- `location_id`: Optional location ID
+- `preview_only`: If `true`, extract and return data without creating asset
+- `language`: OCR language (default: `chinese_cht`)
+- `field_mapping`: Optional custom field names
+
+**Example:**
+```python
+# Preview extraction first
+{
+    "image_path": "/path/to/label.jpg",
+    "status_id": 2,
+    "model_id": 10,
+    "preview_only": true
+}
+
+# Create asset after reviewing preview
+{
+    "image_path": "/path/to/label.jpg",
+    "status_id": 2,
+    "model_id": 10,
+    "location_id": 5,
+    "preview_only": false
+}
+```
+
+#### 10. `batch_import_labels`
+Process multiple label photos at once.
+
+**Parameters:**
+- `image_paths`: Array of image file paths
+- `status_id`: Required status ID for all assets
+- `model_id`: Required model ID for all assets
+- `location_id`: Optional location ID for all assets
+- `stop_on_error`: If `true`, stop processing on first error (default: `false`)
+
+**Example:**
+```python
+{
+    "image_paths": [
+        "/path/to/label1.jpg",
+        "/path/to/label2.jpg",
+        "/path/to/label3.jpg"
+    ],
+    "status_id": 2,
+    "model_id": 10,
+    "location_id": 5,
+    "stop_on_error": false
+}
+
+# Returns:
+{
+    "success": true,
+    "success_count": 2,
+    "failure_count": 1,
+    "results": [
+        {"image": "label1.jpg", "success": true, "asset_id": 123},
+        {"image": "label2.jpg", "success": true, "asset_id": 124},
+        {"image": "label3.jpg", "success": false, "error": "OCR failed"}
+    ]
+}
+```
+
+#### 11. `get_asset_qr_code`
+Generate individual QR code or barcode images for assets.
+
+**Features:**
+- Fetch 2D QR codes or 1D barcodes as PNG images
+- Save to local filesystem
+- Look up by asset ID or asset tag
+
+**Parameters:**
+- `asset_id`: Asset ID (required if `asset_tag` not provided)
+- `asset_tag`: Asset tag (alternative to `asset_id`)
+- `save_path`: Where to save the PNG file (default: `/tmp/qr_code.png`)
+- `code_type`: `"qr"` for 2D QR code or `"barcode"` for 1D barcode (default: `"qr"`)
+
+**Example:**
+```python
+# Generate QR code by asset ID
+{
+    "asset_id": 123,
+    "save_path": "/tmp/asset_123_qr.png",
+    "code_type": "qr"
+}
+
+# Generate barcode by asset tag
+{
+    "asset_tag": "LAP-001",
+    "save_path": "/tmp/lap001_barcode.png",
+    "code_type": "barcode"
+}
+```
+
 ## Integration with MCP Clients
 
 ### Claude Desktop
@@ -347,8 +502,19 @@ The server consolidates operations into a minimal number of tools:
 - Single tool for Asset state operations (`asset_operations`)
 - Specialized tools for specific features (files, labels, maintenance, licenses)
 - Single tool for Consumable CRUD operations (`manage_consumables`)
+- OCR-based label extraction tools for automated data entry (`extract_label_data`, `import_asset_from_label`, `batch_import_labels`)
+- QR code generation tool for individual code images (`get_asset_qr_code`)
 
 This design minimizes the cognitive load on AI assistants while providing comprehensive functionality.
+
+### ROC Date Conversion
+
+The server includes automatic conversion of ROC (Republic of China/Taiwan calendar) dates to Gregorian dates:
+
+- ROC year calculation: `ROC year + 1911 = Gregorian year`
+- Example: `107.07.06` → `2018-07-06`
+- Supports multiple separators: `.`, `-`, `/`
+- Used in label extraction for NTUST and other Taiwan-based institutions
 
 ## Error Handling
 
@@ -413,6 +579,30 @@ Error responses include descriptive messages:
 - If using a `.env` file, make sure it's in the correct location
 - Check that the variables are exported before running the server
 
+### OCR Issues
+
+**Problem:** "PaddleOCR not available" error
+
+**Solution:**
+- Install OpenCV system libraries: `brew install opencv` (macOS)
+- Run `uv sync` to install PaddleOCR dependencies
+- On first OCR run, PaddleOCR will download language models (~10-20MB)
+
+**Problem:** OCR extraction returns low confidence or missing fields
+
+**Solution:**
+- Ensure label photo is clear and well-lit
+- Check that the image is not rotated (PaddleOCR handles rotation automatically)
+- Verify field names match your label format (use custom `field_mapping` if needed)
+- Try higher resolution photos for better OCR accuracy
+
+**Problem:** ROC date conversion fails
+
+**Solution:**
+- Verify date format matches ROC convention: `YYY.MM.DD` (e.g., `107.07.06`)
+- Supported separators: `.`, `-`, `/`
+- Date must have 2-3 digit year, 2-digit month, 2-digit day
+
 ## Development
 
 ### Project Structure
@@ -420,11 +610,26 @@ Error responses include descriptive messages:
 ```
 snipeit-mcp/
 ├── server.py           # Main MCP server implementation
-├── pyproject.toml      # Project configuration
+├── pyproject.toml      # Project configuration and dependencies
 ├── README.md           # This file
+├── test_helpers.py     # Unit tests for OCR helper functions
 ├── .gitignore         # Git ignore rules
 └── .venv/             # Virtual environment (created by uv)
 ```
+
+### Testing
+
+Run the helper function tests:
+
+```bash
+# Run OCR helper tests
+uv run python test_helpers.py
+```
+
+This validates:
+- ROC date conversion (民國年 → Gregorian)
+- Field extraction from Chinese labels
+- Label parsing logic
 
 ### Running in Development Mode
 
@@ -461,4 +666,18 @@ For issues related to:
 
 - Built with [FastMCP](https://gofastmcp.com)
 - Uses [snipeit-python-api](https://github.com/lfctech/snipeit-python-api) for Snipe-IT integration
+- OCR powered by [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) for Traditional Chinese text recognition
 - Designed for [Snipe-IT](https://snipeitapp.com/) asset management system
+
+## Changelog
+
+### 2026-07-06
+- Added OCR-based label extraction for NTUST asset labels
+- Implemented Traditional Chinese OCR support using PaddleOCR
+- Added automatic ROC (Taiwan calendar) to Gregorian date conversion
+- Added `extract_label_data` tool for label OCR extraction
+- Added `import_asset_from_label` workflow tool for one-step import
+- Added `batch_import_labels` tool for bulk label processing
+- Added `get_asset_qr_code` tool for individual QR/barcode image generation
+- Fixed hardcoded dependency path in pyproject.toml
+- Added comprehensive OCR troubleshooting documentation
