@@ -287,23 +287,45 @@ class SupplierData(BaseModel):
 
 
 class UserData(BaseModel):
-    """Model for user data."""
-    first_name: str | None = Field(None, description="First name")
+    """Model for user data (POST/PATCH /api/v1/users)."""
+    first_name: str | None = Field(None, description="First name (required on create)")
     last_name: str | None = Field(None, description="Last name")
-    username: str | None = Field(None, description="Username")
-    password: str | None = Field(None, description="Password")
+    username: str | None = Field(None, description="Username (required on create unless LDAP)")
+    password: str | None = Field(None, description="Password (required on create unless LDAP)")
+    password_confirmation: str | None = Field(
+        None, description="Must match password (auto-filled from password if omitted)"
+    )
     email: str | None = Field(None, description="Email")
-    permissions: str | None = Field(None, description="Permissions JSON")
+    permissions: dict[str, Any] | str | None = Field(None, description="Permissions map or JSON string")
     activated: bool | None = Field(None, description="Activated")
     phone: str | None = Field(None, description="Phone")
+    mobile: str | None = Field(None, description="Mobile phone")
     jobtitle: str | None = Field(None, description="Job title")
-    manager_id: int | None = Field(None, description="Manager ID")
+    display_name: str | None = Field(None, description="Display name")
+    manager_id: int | None = Field(None, description="Manager user ID")
     employee_num: str | None = Field(None, description="Employee number")
     notes: str | None = Field(None, description="Notes")
-    company_id: int | None = Field(None, description="Company ID")
+    company_id: int | None = Field(None, description="Primary company ID (legacy)")
+    company_ids: list[int] | None = Field(None, description="Company IDs (preferred multi-company)")
     location_id: int | None = Field(None, description="Location ID")
     department_id: int | None = Field(None, description="Department ID")
-    groups: list[int] | None = Field(None, description="Group IDs")
+    groups: list[int] | None = Field(None, description="Permission group IDs (superuser only)")
+    remote: bool | None = Field(None, description="Remote worker")
+    vip: bool | None = Field(None, description="VIP flag")
+    autoassign_licenses: bool | None = Field(None, description="Auto-assign licenses")
+    website: str | None = Field(None, description="Website URL")
+    address: str | None = Field(None, description="Street address")
+    city: str | None = Field(None, description="City")
+    state: str | None = Field(None, description="State/province")
+    country: str | None = Field(None, description="Country")
+    zip: str | None = Field(None, description="Postal code")
+    locale: str | None = Field(None, description="Locale")
+    start_date: str | None = Field(None, description="Start date (Y-m-d)")
+    end_date: str | None = Field(None, description="End date (Y-m-d)")
+    send_welcome: bool | int | str | None = Field(
+        None, description="Send welcome email on create (1/true when activated + email set)"
+    )
+    ldap_import: bool | None = Field(None, description="Mark as LDAP-imported (skips password requirement)")
 
 
 class ComponentData(BaseModel):
@@ -2700,59 +2722,118 @@ def manage_suppliers(
 # Users Management
 # ============================================================================
 
+def _prepare_user_payload(user_data: UserData, *, require_create: bool = False) -> dict[str, Any] | dict[str, str]:
+    """Dump UserData and enforce Snipe-IT create rules. Returns payload or error dict."""
+    data = user_data.model_dump(exclude_none=True)
+    if data.get("password") and not data.get("password_confirmation"):
+        data["password_confirmation"] = data["password"]
+
+    if require_create:
+        missing: list[str] = []
+        if not data.get("first_name"):
+            missing.append("first_name")
+        ldap = bool(data.get("ldap_import"))
+        if not ldap and not data.get("username"):
+            missing.append("username")
+        if not ldap and not data.get("password"):
+            missing.append("password")
+        if missing:
+            return {
+                "success": False,
+                "error": f"Missing required fields for create: {', '.join(missing)}",
+            }
+    return data
+
+
 @mcp.tool(
-    description="""Manage Snipe-IT users with CRUD operations.
-    
+    description="""Manage Snipe-IT users (CRUD + nested ops).
+
     Operations:
-    - create: Create a new user (requires user_data with first_name, last_name, username, and email)
-    - get: Retrieve a single user by ID
-    - list: List users with optional pagination and filtering
-    - update: Update an existing user (requires user_id and user_data)
-    - delete: Delete a user (requires user_id)
-    
+    - create: New user (user_data: first_name, username, password required unless ldap_import;
+      password_confirmation auto-filled if omitted)
+    - get / list / update / delete: standard CRUD
+    - restore: Soft-deleted user (user_id)
+    - selectlist: Dropdown list (search/limit/offset)
+    - assets / accessories / licenses / history: items assigned to user (user_id)
+    - email_inventory: Email user their assigned assets (user_id)
+    - two_factor_reset: Reset 2FA for user (user_id)
+    - ldap_sync: Run LDAP user sync (optional location_id)
+
     Returns:
-        dict: Result of the operation including success status and data
+        dict: success status and data/error
     """
 )
 def manage_users(
-    action: Literal["create", "get", "list", "update", "delete"],
+    action: Literal[
+        "create",
+        "get",
+        "list",
+        "update",
+        "delete",
+        "restore",
+        "selectlist",
+        "assets",
+        "accessories",
+        "licenses",
+        "history",
+        "email_inventory",
+        "two_factor_reset",
+        "ldap_sync",
+    ],
     user_id: int | None = None,
     user_data: UserData | None = None,
     limit: int | None = 50,
     offset: int | None = 0,
     search: str | None = None,
     sort: str | None = None,
-    order: Literal["asc", "desc"] | None = None
+    order: Literal["asc", "desc"] | None = None,
+    location_id: int | None = None,
 ) -> dict[str, Any]:
     """Manage users in Snipe-IT."""
     try:
         client = get_snipeit_client()
-        
+
         with client:
             if action == "create":
                 if not user_data:
                     return {"success": False, "error": "user_data is required for create action"}
-                
-                data = user_data.model_dump(exclude_none=True)
-                user = client.users.create(**data)
+
+                prepared = _prepare_user_payload(user_data, require_create=True)
+                if prepared.get("success") is False:
+                    return prepared  # type: ignore[return-value]
+                data = prepared
+
+                username = data.pop("username", None)
+                if not username and not data.get("ldap_import"):
+                    return {"success": False, "error": "username is required for create action"}
+
+                if username:
+                    user = client.users.create(username=username, **data)
+                else:
+                    user = client.users.create(username="", **data)
+
                 return {
                     "success": True,
                     "data": {
                         "id": user.id,
                         "username": getattr(user, "username", None),
+                        "first_name": getattr(user, "first_name", None),
+                        "last_name": getattr(user, "last_name", None),
+                        "email": getattr(user, "email", None),
+                        "name": getattr(user, "name", None),
                     },
-                    "message": f"User created successfully with ID: {user.id}"
+                    "message": f"User created successfully with ID: {user.id}",
                 }
-            
+
             elif action == "get":
                 if not user_id:
                     return {"success": False, "error": "user_id is required for get action"}
-                
+
                 user = client.users.get(user_id)
                 return {"success": True, "data": user}
-            
+
             elif action == "list":
-                params = {}
+                params: dict[str, Any] = {}
                 if limit is not None:
                     params["limit"] = limit
                 if offset is not None:
@@ -2763,34 +2844,101 @@ def manage_users(
                     params["sort"] = sort
                 if order:
                     params["order"] = order
-                
+
                 users = client.users.list(**params)
                 return {"success": True, "data": users, "count": len(users)}
-            
+
             elif action == "update":
                 if not user_id:
                     return {"success": False, "error": "user_id is required for update action"}
                 if not user_data:
                     return {"success": False, "error": "user_data is required for update action"}
-                
-                data = user_data.model_dump(exclude_none=True)
+
+                data = _prepare_user_payload(user_data, require_create=False)
                 user = client.users.update(user_id, **data)
                 return {
                     "success": True,
                     "data": user,
-                    "message": f"User {user_id} updated successfully"
+                    "message": f"User {user_id} updated successfully",
                 }
-            
+
             elif action == "delete":
                 if not user_id:
                     return {"success": False, "error": "user_id is required for delete action"}
-                
+
                 client.users.delete(user_id)
                 return {
                     "success": True,
-                    "message": f"User {user_id} deleted successfully"
+                    "message": f"User {user_id} deleted successfully",
                 }
-    
+
+            elif action == "restore":
+                if not user_id:
+                    return {"success": False, "error": "user_id is required for restore action"}
+                result = client._request("POST", f"users/{user_id}/restore")
+                return {"success": True, "data": result, "message": f"User {user_id} restored successfully"}
+
+            elif action == "selectlist":
+                params = {}
+                if search:
+                    params["search"] = search
+                if limit is not None:
+                    params["limit"] = limit
+                if offset is not None:
+                    params["offset"] = offset
+                result = client._request("GET", "users/selectlist", params=params or None)
+                return {"success": True, "data": result}
+
+            elif action == "assets":
+                if not user_id:
+                    return {"success": False, "error": "user_id is required for assets action"}
+                result = client._request("GET", f"users/{user_id}/assets")
+                return {"success": True, "data": result}
+
+            elif action == "accessories":
+                if not user_id:
+                    return {"success": False, "error": "user_id is required for accessories action"}
+                result = client._request("GET", f"users/{user_id}/accessories")
+                return {"success": True, "data": result}
+
+            elif action == "licenses":
+                if not user_id:
+                    return {"success": False, "error": "user_id is required for licenses action"}
+                result = client._request("GET", f"users/{user_id}/licenses")
+                return {"success": True, "data": result}
+
+            elif action == "history":
+                if not user_id:
+                    return {"success": False, "error": "user_id is required for history action"}
+                params = {}
+                if limit is not None:
+                    params["limit"] = limit
+                if offset is not None:
+                    params["offset"] = offset
+                result = client._request("GET", f"users/{user_id}/history", params=params or None)
+                return {"success": True, "data": result}
+
+            elif action == "email_inventory":
+                if not user_id:
+                    return {"success": False, "error": "user_id is required for email_inventory action"}
+                result = client._request("POST", f"users/{user_id}/email")
+                return {"success": True, "data": result}
+
+            elif action == "two_factor_reset":
+                if not user_id:
+                    return {"success": False, "error": "user_id is required for two_factor_reset action"}
+                result = client._request("POST", "users/two_factor_reset", json={"id": user_id})
+                return {"success": True, "data": result}
+
+            elif action == "ldap_sync":
+                payload: dict[str, Any] = {}
+                if location_id is not None:
+                    payload["location_id"] = location_id
+                result = client._request("POST", "users/ldapsync", json=payload)
+                return {"success": True, "data": result}
+
+            return {"success": False, "error": f"Unknown action: {action}"}
+
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_users: {e}")
         return {"success": False, "error": str(e)}
@@ -3304,29 +3452,31 @@ async def account_profile(
 ) -> dict:
     """
     Access account and profile information for the authenticated user.
-    
+
     Operations:
-    - me: Get current user's profile information
-    - requests: Get assets/licenses requested by the current user
-    - requestable_assets: Get list of assets that can be requested
-    
+    - me: GET /users/me — current user profile
+    - requests: GET /account/requests — assets requested by current user
+    - requestable_assets: GET /account/requestable/hardware — requestable assets
+
     Returns:
         dict: Result of the operation including success status and data
     """
     try:
         with get_snipeit_client() as snipe:
             if action == "me":
-                result = snipe.users.get_me()
+                result = snipe.users.me()
                 return {"success": True, "data": result}
-            
+
             elif action == "requests":
-                result = snipe.users.get_requests()
+                result = snipe._request("GET", "account/requests")
                 return {"success": True, "data": result}
-            
+
             elif action == "requestable_assets":
-                result = snipe.assets.get_requestable()
+                result = snipe._request("GET", "account/requestable/hardware")
                 return {"success": True, "data": result}
-    
+
+            return {"success": False, "error": f"Unknown action: {action}"}
+
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in account_profile: {e}")
         return {"success": False, "error": str(e)}
