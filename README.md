@@ -8,12 +8,11 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for ma
 - **Asset Operations**: Checkout, checkin, audit, and restore assets
 - **File Management**: Upload, download, list, and delete asset attachments
 - **Label Generation**: Generate printable PDF labels for assets
-- **OCR Label Extraction**: Extract asset data from NTUST label photos using Traditional Chinese OCR
+- **Vision-Based Label Import**: Create assets from NTUST label photos — the calling LLM reads the label itself (no OCR pipeline) and passes the extracted fields to `import_asset_from_label` / `batch_import_labels`
 - **QR Code Generation**: Generate individual QR code and barcode images for assets
 - **Maintenance Tracking**: Create maintenance records for assets
 - **License Management**: View licenses associated with assets
 - **Consumable Management**: Full CRUD operations for consumables
-- **ROC Date Conversion**: Automatic conversion of ROC (Republic of China) dates to Gregorian
 - **Type-Safe**: Built with Pydantic models for robust validation
 - **Error Handling**: Comprehensive error handling and logging
 
@@ -23,7 +22,6 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for ma
 - [UV](https://github.com/astral-sh/uv) package manager
 - A running Snipe-IT instance with API access
 - Snipe-IT API token with appropriate permissions
-- **For OCR features**: OpenCV system libraries (install with `brew install opencv` on macOS)
 
 ## Installation
 
@@ -49,7 +47,6 @@ uv sync
 **Note:** The `uv sync` command will install all dependencies including:
 - FastMCP framework
 - Snipe-IT Python API client (from GitHub)
-- PaddleOCR and dependencies for OCR label extraction
 - Pydantic for data validation
 
 ### 3. Configure environment variables
@@ -279,80 +276,49 @@ Comprehensive consumable management with CRUD operations.
 }
 ```
 
-#### 8. `extract_label_data`
-Extract asset data from NTUST (or other) label photos using OCR.
+#### 8. `import_asset_from_label`
+Create a Snipe-IT asset from an NTUST label photo you (the calling LLM) have already read
+with vision — there is no server-side OCR step. Look at the label image, fill in the
+`label_data` fields with what you see, and call this tool.
 
 **Features:**
-- Traditional Chinese OCR support using PaddleOCR
-- Automatic ROC date conversion (民國年) to Gregorian dates
-- Configurable field mappings for different label formats
-- Returns structured data with confidence scores
-
-**Parameters:**
-- `image_path`: Path to the label photo
-- `language`: OCR language (default: `chinese_cht` for Traditional Chinese)
-- `field_mapping`: Optional custom field names (defaults to NTUST format)
-
-**Default NTUST Field Mapping:**
-- 財產編號 → asset_tag
-- 取得日期 → purchase_date (auto-converts ROC dates)
-- 序號 → serial
-- 年限 → warranty_months (converts years to months)
-- 財產名稱 → name
-- 保管單位 → custodian_unit
-- 保管人員 → custodian
-- 規格 → specs
-- 經費來源 → funding_source
-
-**Example:**
-```python
-# Extract data from NTUST label
-{
-    "image_path": "/path/to/label_photo.jpg",
-    "language": "chinese_cht"
-}
-
-# Returns:
-{
-    "success": true,
-    "extracted_data": {
-        "asset_tag": "3140101-03",
-        "serial": "0231X2",
-        "name": "主機含螢幕23吋+",
-        "purchase_date": "2018-07-06",  # Converted from ROC 107.07.06
-        "warranty_months": 48,  # Converted from 4 years
-        "specs": "ASUSMD590",
-        "custodian_unit": "電子系",
-        "custodian": "鄭瑞光",
-        "funding_source": "校務基金",
-        "raw_ocr_text": "...",
-        "confidence": 0.95
-    }
-}
-```
-
-#### 9. `import_asset_from_label`
-One-step workflow: extract label data and create asset in Snipe-IT.
-
-**Features:**
-- Combines OCR extraction with asset creation
-- Preview mode to review data before creating
+- No OCR dependency — the caller reads the label directly
+- Preview mode to review the built payload before creating
 - Automatically builds notes field with specs, custodian, and funding info
 
+**`label_data` fields** (all optional, fill in what you can read off the label):
+- `asset_tag` — 財產編號
+- `purchase_date` — 取得日期, in `YYYY-MM-DD`. If the label shows an ROC date (e.g. `107.07.06`), convert it yourself: ROC year + 1911 = Gregorian year, so `107.07.06` → `2018-07-06`
+- `serial` — 序號
+- `warranty_months` — 年限, converted from years to months (e.g. 4 years → 48)
+- `name` — 財產名稱
+- `custodian_unit` — 保管單位
+- `custodian` — 保管人員
+- `specs` — 規格
+- `funding_source` — 經費來源
+
 **Parameters:**
-- `image_path`: Path to the label photo
+- `label_data`: The fields above, as read from the label
 - `status_id`: Required Snipe-IT status ID for the asset
 - `model_id`: Required Snipe-IT model ID for the asset
 - `location_id`: Optional location ID
-- `preview_only`: If `true`, extract and return data without creating asset
-- `language`: OCR language (default: `chinese_cht`)
-- `field_mapping`: Optional custom field names
+- `preview_only`: If `true`, build and return the payload without creating the asset
 
 **Example:**
 ```python
-# Preview extraction first
+# Preview the payload first
 {
-    "image_path": "/path/to/label.jpg",
+    "label_data": {
+        "asset_tag": "3140101-03",
+        "serial": "0231X2",
+        "name": "主機含螢幕23吋+",
+        "purchase_date": "2018-07-06",
+        "warranty_months": 48,
+        "specs": "ASUSMD590",
+        "custodian_unit": "電子系",
+        "custodian": "鄭瑞光",
+        "funding_source": "校務基金"
+    },
     "status_id": 2,
     "model_id": 10,
     "preview_only": true
@@ -360,7 +326,7 @@ One-step workflow: extract label data and create asset in Snipe-IT.
 
 # Create asset after reviewing preview
 {
-    "image_path": "/path/to/label.jpg",
+    "label_data": { ... same as above ... },
     "status_id": 2,
     "model_id": 10,
     "location_id": 5,
@@ -368,11 +334,12 @@ One-step workflow: extract label data and create asset in Snipe-IT.
 }
 ```
 
-#### 10. `batch_import_labels`
-Process multiple label photos at once.
+#### 9. `batch_import_labels`
+Batch-create assets from multiple NTUST label photos you've already read with vision —
+build one `label_data` entry per asset, same shape as `import_asset_from_label`.
 
 **Parameters:**
-- `image_paths`: Array of image file paths
+- `items`: Array of `label_data` objects, one per asset
 - `status_id`: Required status ID for all assets
 - `model_id`: Required model ID for all assets
 - `location_id`: Optional location ID for all assets
@@ -381,10 +348,9 @@ Process multiple label photos at once.
 **Example:**
 ```python
 {
-    "image_paths": [
-        "/path/to/label1.jpg",
-        "/path/to/label2.jpg",
-        "/path/to/label3.jpg"
+    "items": [
+        {"asset_tag": "3140101-03", "name": "主機含螢幕23吋+", "serial": "0231X2"},
+        {"asset_tag": "3140101-04", "name": "主機含螢幕23吋+", "serial": "0231X3"}
     ],
     "status_id": 2,
     "model_id": 10,
@@ -396,16 +362,15 @@ Process multiple label photos at once.
 {
     "success": true,
     "success_count": 2,
-    "failure_count": 1,
+    "failure_count": 0,
     "results": [
-        {"image": "label1.jpg", "success": true, "asset_id": 123},
-        {"image": "label2.jpg", "success": true, "asset_id": 124},
-        {"image": "label3.jpg", "success": false, "error": "OCR failed"}
+        {"index": 1, "result": {"success": true, "asset": {"id": 123, ...}}},
+        {"index": 2, "result": {"success": true, "asset": {"id": 124, ...}}}
     ]
 }
 ```
 
-#### 11. `get_asset_qr_code`
+#### 10. `get_asset_qr_code`
 Generate individual QR code or barcode images for assets.
 
 **Features:**
@@ -502,7 +467,7 @@ The server consolidates operations into a minimal number of tools:
 - Single tool for Asset state operations (`asset_operations`)
 - Specialized tools for specific features (files, labels, maintenance, licenses)
 - Single tool for Consumable CRUD operations (`manage_consumables`)
-- OCR-based label extraction tools for automated data entry (`extract_label_data`, `import_asset_from_label`, `batch_import_labels`)
+- Vision-based label import tools for automated data entry (`import_asset_from_label`, `batch_import_labels`)
 - QR code generation tool for individual code images (`get_asset_qr_code`)
 
 This design minimizes the cognitive load on AI assistants while providing comprehensive functionality.
@@ -579,29 +544,16 @@ Error responses include descriptive messages:
 - If using a `.env` file, make sure it's in the correct location
 - Check that the variables are exported before running the server
 
-### OCR Issues
+### Label Import Issues
 
-**Problem:** "PaddleOCR not available" error
-
-**Solution:**
-- Install OpenCV system libraries: `brew install opencv` (macOS)
-- Run `uv sync` to install PaddleOCR dependencies
-- On first OCR run, PaddleOCR will download language models (~10-20MB)
-
-**Problem:** OCR extraction returns low confidence or missing fields
+**Problem:** `import_asset_from_label` / `batch_import_labels` create assets with missing or wrong fields
 
 **Solution:**
-- Ensure label photo is clear and well-lit
-- Check that the image is not rotated (PaddleOCR handles rotation automatically)
-- Verify field names match your label format (use custom `field_mapping` if needed)
-- Try higher resolution photos for better OCR accuracy
-
-**Problem:** ROC date conversion fails
-
-**Solution:**
-- Verify date format matches ROC convention: `YYY.MM.DD` (e.g., `107.07.06`)
-- Supported separators: `.`, `-`, `/`
-- Date must have 2-3 digit year, 2-digit month, 2-digit day
+- These tools have no OCR step — the calling LLM must read the label photo itself and pass
+  the extracted values in `label_data`. Double-check the values you read off the image
+  before calling the tool.
+- Verify ROC dates were converted correctly: ROC year + 1911 = Gregorian year (e.g. `107.07.06` → `2018-07-06`)
+- Verify lifespan-in-years was converted to `warranty_months` (e.g. 4 years → 48)
 
 ## Development
 
@@ -612,24 +564,9 @@ snipeit-mcp/
 ├── server.py           # Main MCP server implementation
 ├── pyproject.toml      # Project configuration and dependencies
 ├── README.md           # This file
-├── test_helpers.py     # Unit tests for OCR helper functions
 ├── .gitignore         # Git ignore rules
 └── .venv/             # Virtual environment (created by uv)
 ```
-
-### Testing
-
-Run the helper function tests:
-
-```bash
-# Run OCR helper tests
-uv run python test_helpers.py
-```
-
-This validates:
-- ROC date conversion (民國年 → Gregorian)
-- Field extraction from Chinese labels
-- Label parsing logic
 
 ### Running in Development Mode
 
@@ -666,10 +603,13 @@ For issues related to:
 
 - Built with [FastMCP](https://gofastmcp.com)
 - Uses [snipeit-python-api](https://github.com/lfctech/snipeit-python-api) for Snipe-IT integration
-- OCR powered by [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) for Traditional Chinese text recognition
 - Designed for [Snipe-IT](https://snipeitapp.com/) asset management system
 
 ## Changelog
+
+### 2026-07-22
+- Removed the PaddleOCR pipeline (`extract_label_data` tool, PaddleOCR/OpenCV/Pillow/etc. dependencies) in favor of vision-based label reading: the calling LLM reads the label photo itself and passes structured fields directly
+- `import_asset_from_label` and `batch_import_labels` now take `label_data` (a `LabelAssetData` object) instead of an `image_path`
 
 ### 2026-07-06
 - Added OCR-based label extraction for NTUST asset labels

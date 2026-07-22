@@ -27,15 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# OCR imports (lazy-loaded to avoid startup failures if not installed)
-try:
-    from paddleocr import PaddleOCR
-    from PIL import Image
-    PADDLEOCR_AVAILABLE = True
-except ImportError:
-    PADDLEOCR_AVAILABLE = False
-    logger.warning("PaddleOCR not available. Label extraction tools will not work.")
-
 # Initialize FastMCP server
 mcp = FastMCP(
     name="Snipe-IT MCP Server"
@@ -164,32 +155,25 @@ class ConsumableData(BaseModel):
     notes: str | None = Field(None, description="Additional notes")
 
 
-class LabelFieldMapping(BaseModel):
-    """Model for configurable Chinese field names on NTUST labels."""
-    asset_number: str = Field("財產編號", description="Asset number field name")
-    acquisition_date: str = Field("取得日期", description="Acquisition date field name")
-    serial_number: str = Field("序號", description="Serial number field name")
-    lifespan: str = Field("年限", description="Lifespan field name")
-    asset_name: str = Field("財產名稱", description="Asset name field name")
-    custodian_unit: str = Field("保管單位", description="Custodian unit field name")
-    custodian: str = Field("保管人員", description="Custodian field name")
-    specs: str = Field("規格", description="Specifications field name")
-    funding_source: str = Field("經費來源", description="Funding source field name")
-
-
-class ExtractedLabelData(BaseModel):
-    """Model for extracted label data from OCR."""
-    asset_tag: str | None = Field(None, description="Extracted asset tag (財產編號)")
-    serial: str | None = Field(None, description="Extracted serial number (序號)")
-    name: str | None = Field(None, description="Extracted asset name (財產名稱)")
-    purchase_date: str | None = Field(None, description="Extracted purchase date in YYYY-MM-DD format")
-    warranty_months: int | None = Field(None, description="Extracted lifespan in months")
-    specs: str | None = Field(None, description="Extracted specifications (規格)")
-    custodian_unit: str | None = Field(None, description="Extracted custodian unit (保管單位)")
-    custodian: str | None = Field(None, description="Extracted custodian name (保管人員)")
-    funding_source: str | None = Field(None, description="Extracted funding source (經費來源)")
-    raw_ocr_text: str = Field(..., description="Full OCR text for debugging")
-    confidence: float | None = Field(None, description="Average OCR confidence score")
+class LabelAssetData(BaseModel):
+    """Asset fields read off an NTUST label photo directly (the caller has vision and
+    reads the label itself — no OCR pipeline involved)."""
+    asset_tag: str | None = Field(None, description="Asset tag (財產編號)")
+    serial: str | None = Field(None, description="Serial number (序號)")
+    name: str | None = Field(None, description="Asset name (財產名稱)")
+    purchase_date: str | None = Field(
+        None,
+        description=(
+            "Acquisition date (取得日期) in YYYY-MM-DD format. If the label shows an ROC "
+            "date (e.g. 107.07.06), convert it yourself: ROC year + 1911 = Gregorian year "
+            "(107 -> 2018), giving 2018-07-06."
+        ),
+    )
+    warranty_months: int | None = Field(None, description="Lifespan (年限) in months — convert years shown on the label to months (e.g. 4 years -> 48)")
+    specs: str | None = Field(None, description="Specifications (規格)")
+    custodian_unit: str | None = Field(None, description="Custodian unit (保管單位)")
+    custodian: str | None = Field(None, description="Custodian name (保管人員)")
+    funding_source: str | None = Field(None, description="Funding source (經費來源)")
 
 
 # ============================================================================
@@ -490,148 +474,71 @@ class KitData(BaseModel):
 
 
 # ============================================================================
-# Helper Functions for Label Extraction
+# Structured Error Responses
 # ============================================================================
 
-def convert_roc_to_gregorian(roc_date: str) -> str | None:
+def _error(
+    error_type: str,
+    message: str,
+    *,
+    hint: str | None = None,
+    allowed_values: dict[str, list[str]] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Standard structured error payload returned by every tool on failure.
+
+    Keeps `success`/`error` for backward compatibility with existing callers while adding
+    `status`/`error_type`/`message`/`hint`/`allowed_values` so an LLM caller can recover
+    (e.g. re-query a list action for valid IDs/enum values) instead of parsing a flat string.
     """
-    Convert ROC (Republic of China) date to Gregorian date.
-    
-    ROC year + 1911 = Gregorian year
-    Example: 107.07.06 -> 2018-07-06
-    
-    Args:
-        roc_date: ROC date string (e.g., "107.07.06", "107-07-06", "107/07/06")
-        
-    Returns:
-        Gregorian date in YYYY-MM-DD format, or None if parsing fails
-    """
-    try:
-        # Remove whitespace
-        roc_date = roc_date.strip()
-        
-        # Support multiple separators: . - /
-        parts = re.split(r'[.\-/]', roc_date)
-        if len(parts) != 3:
-            logger.warning(f"Invalid ROC date format: {roc_date}")
-            return None
-        
-        roc_year, month, day = parts
-        
-        # Convert to integers
-        roc_year_int = int(roc_year)
-        month_int = int(month)
-        day_int = int(day)
-        
-        # Convert ROC year to Gregorian
-        gregorian_year = roc_year_int + 1911
-        
-        # Format as YYYY-MM-DD
-        return f"{gregorian_year:04d}-{month_int:02d}-{day_int:02d}"
-        
-    except (ValueError, IndexError) as e:
-        logger.warning(f"Failed to convert ROC date '{roc_date}': {e}")
-        return None
+    result: dict[str, Any] = {
+        "success": False,
+        "error": message,
+        "status": "error",
+        "error_type": error_type,
+        "message": message,
+    }
+    if hint:
+        result["hint"] = hint
+    if allowed_values:
+        result["allowed_values"] = allowed_values
+    if extra:
+        result.update(extra)
+    return result
 
 
-def extract_field_value(ocr_text: str, field_name: str) -> str | None:
-    """
-    Extract value after a field name from OCR text.
-    
-    Looks for patterns like:
-    - "財產編號: 3140101-03"
-    - "財產編號：3140101-03" (full-width colon)
-    - "財產編號 3140101-03" (space separator)
-    
-    Args:
-        ocr_text: Full OCR text
-        field_name: Chinese field name to search for
-        
-    Returns:
-        Extracted value or None if not found
-    """
-    # Try multiple patterns
-    patterns = [
-        rf"{re.escape(field_name)}\s*[:：]\s*([^\n]+)",  # with colon
-        rf"{re.escape(field_name)}\s+([^\n]+)",  # with space
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, ocr_text)
-        if match:
-            value = match.group(1).strip()
-            # Remove common noise characters
-            value = re.sub(r'[|]', '', value)
-            return value if value else None
-    
-    return None
+# Known enum-like fields Snipe-IT's API validates server-side, keyed by a keyword that
+# tends to appear in the API's own error text, mapped to (allowed values, recovery hint).
+_ENUM_FIELD_INFO: dict[str, tuple[list[str] | None, str]] = {
+    "category type": (CATEGORY_TYPES, 'Query `manage_categories` (action="list") to see existing categories, or use one of the allowed values directly.'),
+    "status label": (STATUS_LABEL_TYPES, 'Query `manage_status_labels` (action="list") to see valid status types or IDs before retrying.'),
+    "status_id": (None, 'Query `manage_status_labels` (action="list") to see valid status IDs before retrying.'),
+    "element": (CUSTOM_FIELD_ELEMENTS, "Use one of the allowed custom field element types."),
+    "format": (CUSTOM_FIELD_FORMATS, "Use one of the allowed custom field format types."),
+    "checkout_to_type": (["user", "asset", "location"], "Use one of the allowed checkout target types."),
+}
 
 
-def parse_label_fields(ocr_text: str, field_mapping: LabelFieldMapping) -> dict[str, Any]:
+def _snipeit_validation_error(
+    e: Exception,
+    *,
+    prefix: str = "Validation error",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a structured VALIDATION_FAILED response from a Snipe-IT API validation error.
+
+    Snipe-IT's own error text (e.g. "The selected category type is invalid.") only loosely
+    names the offending field, so this matches on known keywords to attach a `hint` and
+    `allowed_values` instead of leaving the caller to guess at a second attempt.
     """
-    Parse all fields from OCR text using field mapping.
-    
-    Args:
-        ocr_text: Full OCR text from label
-        field_mapping: Field name mapping for Chinese labels
-        
-    Returns:
-        Dictionary of extracted fields
-    """
-    extracted = {}
-    
-    # Extract asset tag (財產編號)
-    asset_tag = extract_field_value(ocr_text, field_mapping.asset_number)
-    if asset_tag:
-        extracted["asset_tag"] = asset_tag
-    
-    # Extract serial number (序號)
-    serial = extract_field_value(ocr_text, field_mapping.serial_number)
-    if serial:
-        extracted["serial"] = serial
-    
-    # Extract asset name (財產名稱)
-    name = extract_field_value(ocr_text, field_mapping.asset_name)
-    if name:
-        extracted["name"] = name
-    
-    # Extract acquisition date (取得日期) and convert ROC to Gregorian
-    roc_date = extract_field_value(ocr_text, field_mapping.acquisition_date)
-    if roc_date:
-        gregorian_date = convert_roc_to_gregorian(roc_date)
-        if gregorian_date:
-            extracted["purchase_date"] = gregorian_date
-    
-    # Extract lifespan (年限) and convert years to months
-    lifespan = extract_field_value(ocr_text, field_mapping.lifespan)
-    if lifespan:
-        try:
-            years = int(re.search(r'\d+', lifespan).group())
-            extracted["warranty_months"] = years * 12
-        except (AttributeError, ValueError):
-            logger.warning(f"Failed to parse lifespan: {lifespan}")
-    
-    # Extract specs (規格)
-    specs = extract_field_value(ocr_text, field_mapping.specs)
-    if specs:
-        extracted["specs"] = specs
-    
-    # Extract custodian unit (保管單位)
-    custodian_unit = extract_field_value(ocr_text, field_mapping.custodian_unit)
-    if custodian_unit:
-        extracted["custodian_unit"] = custodian_unit
-    
-    # Extract custodian (保管人員)
-    custodian = extract_field_value(ocr_text, field_mapping.custodian)
-    if custodian:
-        extracted["custodian"] = custodian
-    
-    # Extract funding source (經費來源)
-    funding_source = extract_field_value(ocr_text, field_mapping.funding_source)
-    if funding_source:
-        extracted["funding_source"] = funding_source
-    
-    return extracted
+    text = str(e)
+    message = f"{prefix}: {text}"
+    haystack = text.lower()
+    for keyword, (allowed, hint) in _ENUM_FIELD_INFO.items():
+        if keyword in haystack:
+            allowed_values = {keyword.replace(" ", "_"): allowed} if allowed else None
+            return _error("VALIDATION_FAILED", message, hint=hint, allowed_values=allowed_values, extra=extra)
+    return _error("VALIDATION_FAILED", message, extra=extra)
 
 
 # ============================================================================
@@ -678,13 +585,10 @@ def manage_assets(
         with client:
             if action == "create":
                 if not asset_data:
-                    return {"success": False, "error": "asset_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "asset_data is required for create action")
                 
                 if not asset_data.status_id or not asset_data.model_id:
-                    return {
-                        "success": False,
-                        "error": "status_id and model_id are required to create an asset"
-                    }
+                    return _error("MISSING_PARAMETER", "status_id and model_id are required to create an asset")
                 
                 # Build creation payload
                 create_kwargs = {k: v for k, v in asset_data.model_dump().items() if v is not None}
@@ -709,10 +613,7 @@ def manage_assets(
                 elif asset_id:
                     asset = client.assets.get(asset_id)
                 else:
-                    return {
-                        "success": False,
-                        "error": "One of asset_id, asset_tag, or serial is required for get action"
-                    }
+                    return _error("MISSING_PARAMETER", "One of asset_id, asset_tag, or serial is required for get action")
                 
                 # Extract asset data
                 asset_dict = {
@@ -769,9 +670,9 @@ def manage_assets(
             
             elif action == "update":
                 if not asset_id:
-                    return {"success": False, "error": "asset_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "asset_id is required for update action")
                 if not asset_data:
-                    return {"success": False, "error": "asset_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "asset_data is required for update action")
                 
                 # Build update payload (only include non-None values)
                 update_kwargs = {k: v for k, v in asset_data.model_dump().items() if v is not None}
@@ -790,7 +691,7 @@ def manage_assets(
             
             elif action == "delete":
                 if not asset_id:
-                    return {"success": False, "error": "asset_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "asset_id is required for delete action")
                 
                 client.assets.delete(asset_id)
                 
@@ -803,19 +704,19 @@ def manage_assets(
             
     except SnipeITNotFoundError as e:
         logger.error(f"Asset not found: {e}")
-        return {"success": False, "error": f"Asset not found: {str(e)}"}
+        return _error("NOT_FOUND", f"Asset not found: {str(e)}")
     except SnipeITAuthenticationError as e:
         logger.error(f"Authentication error: {e}")
-        return {"success": False, "error": f"Authentication failed: {str(e)}"}
+        return _error("AUTHENTICATION_FAILED", f"Authentication failed: {str(e)}")
     except SnipeITValidationError as e:
         logger.error(f"Validation error: {e}")
-        return {"success": False, "error": f"Validation error: {str(e)}"}
+        return _snipeit_validation_error(e)
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {"success": False, "error": f"Snipe-IT error: {str(e)}"}
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in manage_assets: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool(
@@ -854,7 +755,7 @@ def asset_operations(
             
             if action == "checkout":
                 if not checkout_data:
-                    return {"success": False, "error": "checkout_data is required for checkout action"}
+                    return _error("MISSING_PARAMETER", "checkout_data is required for checkout action")
                 
                 # Build checkout kwargs
                 checkout_kwargs = {
@@ -945,13 +846,13 @@ def asset_operations(
     
     except SnipeITNotFoundError as e:
         logger.error(f"Asset not found: {e}")
-        return {"success": False, "error": f"Asset not found: {str(e)}"}
+        return _error("NOT_FOUND", f"Asset not found: {str(e)}")
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {"success": False, "error": f"Snipe-IT error: {str(e)}"}
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in asset_operations: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool(
@@ -989,7 +890,7 @@ def asset_files(
         with client:
             if action == "upload":
                 if not file_paths:
-                    return {"success": False, "error": "file_paths is required for upload action"}
+                    return _error("MISSING_PARAMETER", "file_paths is required for upload action")
                 
                 result = client.assets.upload_files(asset_id, file_paths, notes)
                 
@@ -1013,9 +914,9 @@ def asset_files(
             
             elif action == "download":
                 if file_id is None:
-                    return {"success": False, "error": "file_id is required for download action"}
+                    return _error("MISSING_PARAMETER", "file_id is required for download action")
                 if not save_path:
-                    return {"success": False, "error": "save_path is required for download action"}
+                    return _error("MISSING_PARAMETER", "save_path is required for download action")
                 
                 downloaded_path = client.assets.download_file(asset_id, file_id, save_path)
                 
@@ -1030,7 +931,7 @@ def asset_files(
             
             elif action == "delete":
                 if file_id is None:
-                    return {"success": False, "error": "file_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "file_id is required for delete action")
                 
                 client.assets.delete_file(asset_id, file_id)
                 
@@ -1044,13 +945,13 @@ def asset_files(
     
     except SnipeITNotFoundError as e:
         logger.error(f"Asset or file not found: {e}")
-        return {"success": False, "error": f"Not found: {str(e)}"}
+        return _error("NOT_FOUND", f"Not found: {str(e)}")
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {"success": False, "error": f"Snipe-IT error: {str(e)}"}
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in asset_files: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool(
@@ -1077,10 +978,7 @@ def asset_labels(
         client = get_snipeit_client()
         
         if not asset_ids and not asset_tags:
-            return {
-                "success": False,
-                "error": "Either asset_ids or asset_tags must be provided"
-            }
+            return _error("MISSING_PARAMETER", "Either asset_ids or asset_tags must be provided")
         
         with client:
             # If asset_ids provided, get the Asset objects
@@ -1100,13 +998,13 @@ def asset_labels(
     
     except SnipeITNotFoundError as e:
         logger.error(f"Asset not found: {e}")
-        return {"success": False, "error": f"Asset not found: {str(e)}"}
+        return _error("NOT_FOUND", f"Asset not found: {str(e)}")
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {"success": False, "error": f"Snipe-IT error: {str(e)}"}
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in asset_labels: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool(
@@ -1166,13 +1064,13 @@ def asset_maintenance(
     
     except SnipeITNotFoundError as e:
         logger.error(f"Asset not found: {e}")
-        return {"success": False, "error": f"Asset not found: {str(e)}"}
+        return _error("NOT_FOUND", f"Asset not found: {str(e)}")
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {"success": False, "error": f"Snipe-IT error: {str(e)}"}
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in asset_maintenance: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool(
@@ -1204,13 +1102,13 @@ def asset_licenses(
     
     except SnipeITNotFoundError as e:
         logger.error(f"Asset not found: {e}")
-        return {"success": False, "error": f"Asset not found: {str(e)}"}
+        return _error("NOT_FOUND", f"Asset not found: {str(e)}")
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {"success": False, "error": f"Snipe-IT error: {str(e)}"}
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in asset_licenses: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -1255,13 +1153,10 @@ def manage_consumables(
         with client:
             if action == "create":
                 if not consumable_data:
-                    return {"success": False, "error": "consumable_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "consumable_data is required for create action")
                 
                 if not consumable_data.name or consumable_data.qty is None or not consumable_data.category_id:
-                    return {
-                        "success": False,
-                        "error": "name, qty, and category_id are required to create a consumable"
-                    }
+                    return _error("MISSING_PARAMETER", "name, qty, and category_id are required to create a consumable")
                 
                 # Build creation payload
                 create_kwargs = {k: v for k, v in consumable_data.model_dump().items() if v is not None}
@@ -1279,7 +1174,7 @@ def manage_consumables(
             
             elif action == "get":
                 if not consumable_id:
-                    return {"success": False, "error": "consumable_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "consumable_id is required for get action")
                 
                 consumable = client.consumables.get(consumable_id)
                 
@@ -1337,9 +1232,9 @@ def manage_consumables(
             
             elif action == "update":
                 if not consumable_id:
-                    return {"success": False, "error": "consumable_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "consumable_id is required for update action")
                 if not consumable_data:
-                    return {"success": False, "error": "consumable_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "consumable_data is required for update action")
                 
                 # Build update payload (only include non-None values)
                 update_kwargs = {k: v for k, v in consumable_data.model_dump().items() if v is not None}
@@ -1358,7 +1253,7 @@ def manage_consumables(
             
             elif action == "delete":
                 if not consumable_id:
-                    return {"success": False, "error": "consumable_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "consumable_id is required for delete action")
                 
                 client.consumables.delete(consumable_id)
                 
@@ -1371,136 +1266,27 @@ def manage_consumables(
     
     except SnipeITNotFoundError as e:
         logger.error(f"Consumable not found: {e}")
-        return {"success": False, "error": f"Consumable not found: {str(e)}"}
+        return _error("NOT_FOUND", f"Consumable not found: {str(e)}")
     except SnipeITAuthenticationError as e:
         logger.error(f"Authentication error: {e}")
-        return {"success": False, "error": f"Authentication failed: {str(e)}"}
+        return _error("AUTHENTICATION_FAILED", f"Authentication failed: {str(e)}")
     except SnipeITValidationError as e:
         logger.error(f"Validation error: {e}")
-        return {"success": False, "error": f"Validation error: {str(e)}"}
+        return _snipeit_validation_error(e)
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {"success": False, "error": f"Snipe-IT error: {str(e)}"}
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in manage_consumables: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
-# Label Extraction Tools
+# Label Import Tools
+#
+# The caller (an LLM with vision) reads the NTUST label photo itself and passes the
+# extracted fields directly — no server-side OCR pipeline is involved.
 # ============================================================================
-
-@mcp.tool(
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-    }
-)
-def extract_label_data(
-    image_path: Annotated[str, "Path to the label image file"],
-    language: Annotated[str, "OCR language code (default: chinese_cht for Traditional Chinese)"] = "chinese_cht",
-    field_mapping: Annotated[LabelFieldMapping | None, "Custom field name mapping for labels"] = None,
-) -> dict[str, Any]:
-    """Extract asset data from NTUST label photos using OCR.
-    
-    Uses PaddleOCR to extract text from Traditional Chinese labels and parse
-    structured asset information including asset tag, serial number, purchase date,
-    and other fields.
-    
-    Supports ROC (Republic of China) date conversion to Gregorian dates.
-    
-    Args:
-        image_path: Path to the label image file (JPEG, PNG, etc.)
-        language: OCR language code (default: "chinese_cht" for Traditional Chinese)
-        field_mapping: Optional custom field names (defaults to NTUST standard fields)
-    
-    Returns:
-        dict: Extracted label data with asset_tag, serial, name, purchase_date, etc.
-    """
-    if not PADDLEOCR_AVAILABLE:
-        return {
-            "success": False,
-            "error": "PaddleOCR is not installed. Install dependencies with: uv sync"
-        }
-    
-    try:
-        # Validate image path
-        image_file = Path(image_path)
-        if not image_file.exists():
-            return {"success": False, "error": f"Image file not found: {image_path}"}
-        
-        if not image_file.is_file():
-            return {"success": False, "error": f"Path is not a file: {image_path}"}
-        
-        # Use default NTUST field mapping if not provided
-        if field_mapping is None:
-            field_mapping = LabelFieldMapping()
-        
-        logger.info(f"Initializing PaddleOCR with language: {language}")
-        
-        # Initialize PaddleOCR (use_angle_cls=True for better rotated text detection)
-        ocr = PaddleOCR(
-            use_angle_cls=True,
-            lang=language,
-            use_gpu=False,  # CPU-only for compatibility
-            show_log=False
-        )
-        
-        # Run OCR
-        logger.info(f"Running OCR on image: {image_path}")
-        result = ocr.ocr(str(image_file), cls=True)
-        
-        if not result or not result[0]:
-            return {
-                "success": False,
-                "error": "No text detected in image"
-            }
-        
-        # Extract text and confidence scores
-        ocr_lines = []
-        confidence_scores = []
-        
-        for line in result[0]:
-            text = line[1][0]  # Extract text
-            confidence = line[1][1]  # Extract confidence score
-            ocr_lines.append(text)
-            confidence_scores.append(confidence)
-        
-        # Combine all OCR text
-        full_ocr_text = "\n".join(ocr_lines)
-        avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.0
-        
-        logger.info(f"OCR completed. Detected {len(ocr_lines)} lines with avg confidence: {avg_confidence:.2f}")
-        
-        # Parse fields from OCR text
-        extracted_fields = parse_label_fields(full_ocr_text, field_mapping)
-        
-        # Build response
-        extracted_data = ExtractedLabelData(
-            asset_tag=extracted_fields.get("asset_tag"),
-            serial=extracted_fields.get("serial"),
-            name=extracted_fields.get("name"),
-            purchase_date=extracted_fields.get("purchase_date"),
-            warranty_months=extracted_fields.get("warranty_months"),
-            specs=extracted_fields.get("specs"),
-            custodian_unit=extracted_fields.get("custodian_unit"),
-            custodian=extracted_fields.get("custodian"),
-            funding_source=extracted_fields.get("funding_source"),
-            raw_ocr_text=full_ocr_text,
-            confidence=round(avg_confidence, 3)
-        )
-        
-        return {
-            "success": True,
-            "extracted_data": extracted_data.model_dump(),
-            "ocr_lines_count": len(ocr_lines)
-        }
-    
-    except Exception as e:
-        logger.error(f"Error in extract_label_data: {e}", exc_info=True)
-        return {"success": False, "error": f"OCR extraction failed: {str(e)}"}
-
 
 @mcp.tool(
     annotations={
@@ -1510,80 +1296,53 @@ def extract_label_data(
     }
 )
 def import_asset_from_label(
-    image_path: Annotated[str, "Path to the label image file"],
+    label_data: Annotated[LabelAssetData, "Asset fields read directly off the label photo"],
     status_id: Annotated[int, "Status label ID (required for asset creation)"],
     model_id: Annotated[int, "Asset model ID (required for asset creation)"],
     location_id: Annotated[int | None, "Location ID (optional)"] = None,
-    language: Annotated[str, "OCR language code"] = "chinese_cht",
-    field_mapping: Annotated[LabelFieldMapping | None, "Custom field name mapping"] = None,
-    preview_only: Annotated[bool, "If True, extract data without creating asset"] = False,
+    preview_only: Annotated[bool, "If True, return the asset payload without creating it"] = False,
 ) -> dict[str, Any]:
-    """Extract label data and create asset in Snipe-IT in one step.
-    
-    This workflow tool combines OCR extraction with asset creation. Use preview_only=True
-    to review extracted data before committing to asset creation.
-    
-    Args:
-        image_path: Path to the label image file
-        status_id: Status label ID (required, e.g., 2 for "Ready to Deploy")
-        model_id: Asset model ID (required)
-        location_id: Location ID (optional)
-        language: OCR language code (default: "chinese_cht")
-        field_mapping: Custom field name mapping (optional)
-        preview_only: If True, only extract and return data without creating asset
-    
+    """Create a Snipe-IT asset from an NTUST label photo you've already read with vision.
+
+    Look at the label image yourself, fill in `label_data` with what you see (converting
+    ROC dates and year-based lifespans as described on each field), then call this tool.
+    Use preview_only=True to review the payload before committing to asset creation.
+
     Returns:
-        dict: Extraction result and asset creation result (if preview_only=False)
+        dict: The asset creation result (or payload preview if preview_only=True)
     """
     try:
-        # Step 1: Extract label data
-        extraction_result = extract_label_data(
-            image_path=image_path,
-            language=language,
-            field_mapping=field_mapping
+        asset_data = AssetData(
+            status_id=status_id,
+            model_id=model_id,
+            asset_tag=label_data.asset_tag,
+            name=label_data.name,
+            serial=label_data.serial,
+            purchase_date=label_data.purchase_date,
+            warranty_months=label_data.warranty_months,
+            location_id=location_id,
+            notes=f"Imported from label. Specs: {label_data.specs or 'N/A'}\n"
+                  f"Custodian Unit: {label_data.custodian_unit or 'N/A'}\n"
+                  f"Custodian: {label_data.custodian or 'N/A'}\n"
+                  f"Funding: {label_data.funding_source or 'N/A'}"
         )
-        
-        if not extraction_result.get("success"):
-            return extraction_result
-        
-        extracted_data = extraction_result["extracted_data"]
-        
-        # If preview only, return extracted data
+        create_kwargs = {k: v for k, v in asset_data.model_dump().items() if v is not None}
+
         if preview_only:
             return {
                 "success": True,
                 "preview_mode": True,
-                "extracted_data": extracted_data,
-                "message": "Data extracted successfully. Set preview_only=False to create asset."
+                "asset_payload": create_kwargs,
+                "message": "Payload built successfully. Set preview_only=False to create asset."
             }
-        
-        # Step 2: Create asset from extracted data
-        asset_data = AssetData(
-            status_id=status_id,
-            model_id=model_id,
-            asset_tag=extracted_data.get("asset_tag"),
-            name=extracted_data.get("name"),
-            serial=extracted_data.get("serial"),
-            purchase_date=extracted_data.get("purchase_date"),
-            warranty_months=extracted_data.get("warranty_months"),
-            location_id=location_id,
-            notes=f"Imported from label. Specs: {extracted_data.get('specs', 'N/A')}\n"
-                  f"Custodian Unit: {extracted_data.get('custodian_unit', 'N/A')}\n"
-                  f"Custodian: {extracted_data.get('custodian', 'N/A')}\n"
-                  f"Funding: {extracted_data.get('funding_source', 'N/A')}"
-        )
-        
-        # Create asset using existing manage_assets tool logic
+
         client = get_snipeit_client()
-        
+
         with client:
-            # Build creation payload (only include non-None values)
-            create_kwargs = {k: v for k, v in asset_data.model_dump().items() if v is not None}
             asset = client.hardware.create(**create_kwargs)
-            
+
             return {
                 "success": True,
-                "extracted_data": extracted_data,
                 "asset": {
                     "id": asset.id,
                     "asset_tag": getattr(asset, "asset_tag", None),
@@ -1592,24 +1351,16 @@ def import_asset_from_label(
                 },
                 "message": f"Asset created successfully with ID: {asset.id}"
             }
-    
+
     except SnipeITValidationError as e:
         logger.error(f"Validation error: {e}")
-        return {
-            "success": False,
-            "error": f"Asset creation failed: {str(e)}",
-            "extracted_data": extraction_result.get("extracted_data") if extraction_result.get("success") else None
-        }
+        return _snipeit_validation_error(e, prefix="Asset creation failed")
     except SnipeITException as e:
         logger.error(f"Snipe-IT error: {e}")
-        return {
-            "success": False,
-            "error": f"Snipe-IT error: {str(e)}",
-            "extracted_data": extraction_result.get("extracted_data") if extraction_result.get("success") else None
-        }
+        return _error("API_ERROR", f"Snipe-IT error: {str(e)}")
     except Exception as e:
         logger.error(f"Unexpected error in import_asset_from_label: {e}", exc_info=True)
-        return {"success": False, "error": f"Import failed: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Import failed: {str(e)}")
 
 
 @mcp.tool(
@@ -1620,62 +1371,51 @@ def import_asset_from_label(
     }
 )
 def batch_import_labels(
-    image_paths: Annotated[list[str], "List of paths to label image files"],
+    items: Annotated[list[LabelAssetData], "Asset fields read directly off each label photo, one entry per asset"],
     status_id: Annotated[int, "Status label ID for all assets"],
     model_id: Annotated[int, "Asset model ID for all assets"],
     location_id: Annotated[int | None, "Location ID for all assets (optional)"] = None,
-    language: Annotated[str, "OCR language code"] = "chinese_cht",
     stop_on_error: Annotated[bool, "Stop processing on first error"] = False,
 ) -> dict[str, Any]:
-    """Batch import multiple assets from label images.
-    
-    Processes multiple label images and creates assets for each one. Returns
-    summary of successes and failures.
-    
-    Args:
-        image_paths: List of paths to label image files
-        status_id: Status label ID for all assets
-        model_id: Asset model ID for all assets
-        location_id: Location ID for all assets (optional)
-        language: OCR language code (default: "chinese_cht")
-        stop_on_error: If True, stop processing on first error
-    
+    """Batch-create assets from multiple NTUST label photos you've already read with vision.
+
+    Look at each label image yourself and build one `LabelAssetData` entry per asset in
+    `items`, then call this tool. Returns a summary of successes and failures.
+
     Returns:
         dict: Summary with success_count, failure_count, and detailed results
     """
     results = []
     success_count = 0
     failure_count = 0
-    
-    for i, image_path in enumerate(image_paths, 1):
-        logger.info(f"Processing label {i}/{len(image_paths)}: {image_path}")
-        
+
+    for i, label_data in enumerate(items, 1):
+        logger.info(f"Processing label {i}/{len(items)}")
+
         result = import_asset_from_label(
-            image_path=image_path,
+            label_data=label_data,
             status_id=status_id,
             model_id=model_id,
             location_id=location_id,
-            language=language,
             preview_only=False
         )
-        
+
         if result.get("success"):
             success_count += 1
         else:
             failure_count += 1
             if stop_on_error:
-                logger.warning(f"Stopping batch import due to error on image {i}")
+                logger.warning(f"Stopping batch import due to error on item {i}")
                 break
-        
+
         results.append({
-            "image_path": image_path,
             "index": i,
             "result": result
         })
-    
+
     return {
         "success": True,
-        "total": len(image_paths),
+        "total": len(items),
         "processed": len(results),
         "success_count": success_count,
         "failure_count": failure_count,
@@ -1712,7 +1452,7 @@ def get_asset_qr_code(
     """
     try:
         if not asset_id and not asset_tag:
-            return {"success": False, "error": "Either asset_id or asset_tag must be provided"}
+            return _error("MISSING_PARAMETER", "Either asset_id or asset_tag must be provided")
         
         client = get_snipeit_client()
         
@@ -1721,7 +1461,7 @@ def get_asset_qr_code(
             with client:
                 assets = client.hardware.list(search=asset_tag, limit=1)
                 if not assets:
-                    return {"success": False, "error": f"Asset not found with tag: {asset_tag}"}
+                    return _error("NOT_FOUND", f"Asset not found with tag: {asset_tag}")
                 asset_id = assets[0].id
         
         # Build URL based on code type
@@ -1755,10 +1495,10 @@ def get_asset_qr_code(
     
     except requests.HTTPError as e:
         logger.error(f"HTTP error fetching {code_type}: {e}")
-        return {"success": False, "error": f"Failed to fetch {code_type}: {str(e)}"}
+        return _error("API_ERROR", f"Failed to fetch {code_type}: {str(e)}")
     except Exception as e:
         logger.error(f"Error in get_asset_qr_code: {e}", exc_info=True)
-        return {"success": False, "error": f"Failed to get {code_type}: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Failed to get {code_type}: {str(e)}")
 
 
 
@@ -1797,7 +1537,7 @@ def manage_accessories(
         with client:
             if action == "create":
                 if not accessory_data:
-                    return {"success": False, "error": "accessory_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "accessory_data is required for create action")
                 
                 data = accessory_data.model_dump(exclude_none=True)
                 accessory = client.accessories.create(**data)
@@ -1812,7 +1552,7 @@ def manage_accessories(
             
             elif action == "get":
                 if not accessory_id:
-                    return {"success": False, "error": "accessory_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "accessory_id is required for get action")
                 
                 accessory = client.accessories.get(accessory_id)
                 return {"success": True, "data": accessory}
@@ -1835,9 +1575,9 @@ def manage_accessories(
             
             elif action == "update":
                 if not accessory_id:
-                    return {"success": False, "error": "accessory_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "accessory_id is required for update action")
                 if not accessory_data:
-                    return {"success": False, "error": "accessory_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "accessory_data is required for update action")
                 
                 data = accessory_data.model_dump(exclude_none=True)
                 accessory = client.accessories.update(accessory_id, **data)
@@ -1849,7 +1589,7 @@ def manage_accessories(
             
             elif action == "delete":
                 if not accessory_id:
-                    return {"success": False, "error": "accessory_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "accessory_id is required for delete action")
                 
                 client.accessories.delete(accessory_id)
                 return {
@@ -1859,10 +1599,10 @@ def manage_accessories(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_accessories: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_accessories: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool(
@@ -1891,7 +1631,7 @@ def accessory_operations(
         with client:
             if action == "checkout":
                 if not assigned_to:
-                    return {"success": False, "error": "assigned_to (user_id) is required for checkout"}
+                    return _error("MISSING_PARAMETER", "assigned_to (user_id) is required for checkout")
                 
                 params = {"assigned_to": assigned_to}
                 if note:
@@ -1922,10 +1662,10 @@ def accessory_operations(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in accessory_operations: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in accessory_operations: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -1964,7 +1704,7 @@ def manage_categories(
         with client:
             if action == "create":
                 if not category_data:
-                    return {"success": False, "error": "category_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "category_data is required for create action")
                 
                 data = category_data.model_dump(exclude_none=True)
                 category = client.categories.create(**data)
@@ -1979,7 +1719,7 @@ def manage_categories(
             
             elif action == "get":
                 if not category_id:
-                    return {"success": False, "error": "category_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "category_id is required for get action")
                 
                 category = client.categories.get(category_id)
                 return {"success": True, "data": category}
@@ -2002,9 +1742,9 @@ def manage_categories(
             
             elif action == "update":
                 if not category_id:
-                    return {"success": False, "error": "category_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "category_id is required for update action")
                 if not category_data:
-                    return {"success": False, "error": "category_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "category_data is required for update action")
                 
                 data = category_data.model_dump(exclude_none=True)
                 category = client.categories.update(category_id, **data)
@@ -2016,7 +1756,7 @@ def manage_categories(
             
             elif action == "delete":
                 if not category_id:
-                    return {"success": False, "error": "category_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "category_id is required for delete action")
                 
                 client.categories.delete(category_id)
                 return {
@@ -2026,10 +1766,10 @@ def manage_categories(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_categories: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_categories: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2067,7 +1807,7 @@ def manage_companies(
         with client:
             if action == "create":
                 if not company_data:
-                    return {"success": False, "error": "company_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "company_data is required for create action")
                 
                 data = company_data.model_dump(exclude_none=True)
                 company = client.companies.create(**data)
@@ -2082,7 +1822,7 @@ def manage_companies(
             
             elif action == "get":
                 if not company_id:
-                    return {"success": False, "error": "company_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "company_id is required for get action")
                 
                 company = client.companies.get(company_id)
                 return {"success": True, "data": company}
@@ -2105,9 +1845,9 @@ def manage_companies(
             
             elif action == "update":
                 if not company_id:
-                    return {"success": False, "error": "company_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "company_id is required for update action")
                 if not company_data:
-                    return {"success": False, "error": "company_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "company_data is required for update action")
                 
                 data = company_data.model_dump(exclude_none=True)
                 company = client.companies.update(company_id, **data)
@@ -2119,7 +1859,7 @@ def manage_companies(
             
             elif action == "delete":
                 if not company_id:
-                    return {"success": False, "error": "company_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "company_id is required for delete action")
                 
                 client.companies.delete(company_id)
                 return {
@@ -2129,10 +1869,10 @@ def manage_companies(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_companies: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_companies: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2170,7 +1910,7 @@ def manage_licenses(
         with client:
             if action == "create":
                 if not license_data:
-                    return {"success": False, "error": "license_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "license_data is required for create action")
                 
                 data = license_data.model_dump(exclude_none=True)
                 license = client.licenses.create(**data)
@@ -2185,7 +1925,7 @@ def manage_licenses(
             
             elif action == "get":
                 if not license_id:
-                    return {"success": False, "error": "license_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "license_id is required for get action")
                 
                 license = client.licenses.get(license_id)
                 return {"success": True, "data": license}
@@ -2208,9 +1948,9 @@ def manage_licenses(
             
             elif action == "update":
                 if not license_id:
-                    return {"success": False, "error": "license_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "license_id is required for update action")
                 if not license_data:
-                    return {"success": False, "error": "license_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "license_data is required for update action")
                 
                 data = license_data.model_dump(exclude_none=True)
                 license = client.licenses.update(license_id, **data)
@@ -2222,7 +1962,7 @@ def manage_licenses(
             
             elif action == "delete":
                 if not license_id:
-                    return {"success": False, "error": "license_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "license_id is required for delete action")
                 
                 client.licenses.delete(license_id)
                 return {
@@ -2232,10 +1972,10 @@ def manage_licenses(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_licenses: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_licenses: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool(
@@ -2265,7 +2005,7 @@ def license_seats_operations(
         with client:
             if action == "checkout":
                 if not assigned_to:
-                    return {"success": False, "error": "assigned_to (user_id) is required for checkout"}
+                    return _error("MISSING_PARAMETER", "assigned_to (user_id) is required for checkout")
                 
                 params = {"assigned_to": assigned_to}
                 if asset_id:
@@ -2282,7 +2022,7 @@ def license_seats_operations(
             
             elif action == "checkin":
                 if not seat_id:
-                    return {"success": False, "error": "seat_id is required for checkin"}
+                    return _error("MISSING_PARAMETER", "seat_id is required for checkin")
                 
                 result = client.licenses.checkin(license_id, seat_id)
                 return {
@@ -2297,10 +2037,10 @@ def license_seats_operations(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in license_seats_operations: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in license_seats_operations: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2338,7 +2078,7 @@ def manage_locations(
         with client:
             if action == "create":
                 if not location_data:
-                    return {"success": False, "error": "location_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "location_data is required for create action")
                 
                 data = location_data.model_dump(exclude_none=True)
                 location = client.locations.create(**data)
@@ -2353,7 +2093,7 @@ def manage_locations(
             
             elif action == "get":
                 if not location_id:
-                    return {"success": False, "error": "location_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "location_id is required for get action")
                 
                 location = client.locations.get(location_id)
                 return {"success": True, "data": location}
@@ -2376,9 +2116,9 @@ def manage_locations(
             
             elif action == "update":
                 if not location_id:
-                    return {"success": False, "error": "location_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "location_id is required for update action")
                 if not location_data:
-                    return {"success": False, "error": "location_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "location_data is required for update action")
                 
                 data = location_data.model_dump(exclude_none=True)
                 location = client.locations.update(location_id, **data)
@@ -2390,7 +2130,7 @@ def manage_locations(
             
             elif action == "delete":
                 if not location_id:
-                    return {"success": False, "error": "location_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "location_id is required for delete action")
                 
                 client.locations.delete(location_id)
                 return {
@@ -2400,10 +2140,10 @@ def manage_locations(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_locations: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_locations: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2441,7 +2181,7 @@ def manage_manufacturers(
         with client:
             if action == "create":
                 if not manufacturer_data:
-                    return {"success": False, "error": "manufacturer_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "manufacturer_data is required for create action")
                 
                 data = manufacturer_data.model_dump(exclude_none=True)
                 manufacturer = client.manufacturers.create(**data)
@@ -2456,7 +2196,7 @@ def manage_manufacturers(
             
             elif action == "get":
                 if not manufacturer_id:
-                    return {"success": False, "error": "manufacturer_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "manufacturer_id is required for get action")
                 
                 manufacturer = client.manufacturers.get(manufacturer_id)
                 return {"success": True, "data": manufacturer}
@@ -2479,9 +2219,9 @@ def manage_manufacturers(
             
             elif action == "update":
                 if not manufacturer_id:
-                    return {"success": False, "error": "manufacturer_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "manufacturer_id is required for update action")
                 if not manufacturer_data:
-                    return {"success": False, "error": "manufacturer_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "manufacturer_data is required for update action")
                 
                 data = manufacturer_data.model_dump(exclude_none=True)
                 manufacturer = client.manufacturers.update(manufacturer_id, **data)
@@ -2493,7 +2233,7 @@ def manage_manufacturers(
             
             elif action == "delete":
                 if not manufacturer_id:
-                    return {"success": False, "error": "manufacturer_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "manufacturer_id is required for delete action")
                 
                 client.manufacturers.delete(manufacturer_id)
                 return {
@@ -2503,10 +2243,10 @@ def manage_manufacturers(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_manufacturers: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_manufacturers: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2544,7 +2284,7 @@ def manage_models(
         with client:
             if action == "create":
                 if not model_data:
-                    return {"success": False, "error": "model_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "model_data is required for create action")
                 
                 data = model_data.model_dump(exclude_none=True)
                 model = client.models.create(**data)
@@ -2559,7 +2299,7 @@ def manage_models(
             
             elif action == "get":
                 if not model_id:
-                    return {"success": False, "error": "model_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "model_id is required for get action")
                 
                 model = client.models.get(model_id)
                 return {"success": True, "data": model}
@@ -2582,9 +2322,9 @@ def manage_models(
             
             elif action == "update":
                 if not model_id:
-                    return {"success": False, "error": "model_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "model_id is required for update action")
                 if not model_data:
-                    return {"success": False, "error": "model_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "model_data is required for update action")
                 
                 data = model_data.model_dump(exclude_none=True)
                 model = client.models.update(model_id, **data)
@@ -2596,7 +2336,7 @@ def manage_models(
             
             elif action == "delete":
                 if not model_id:
-                    return {"success": False, "error": "model_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "model_id is required for delete action")
                 
                 client.models.delete(model_id)
                 return {
@@ -2606,10 +2346,10 @@ def manage_models(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_models: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_models: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2648,7 +2388,7 @@ def manage_status_labels(
         with client:
             if action == "create":
                 if not status_data:
-                    return {"success": False, "error": "status_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "status_data is required for create action")
                 
                 data = status_data.model_dump(exclude_none=True)
                 status = client.status_labels.create(**data)
@@ -2663,7 +2403,7 @@ def manage_status_labels(
             
             elif action == "get":
                 if not status_id:
-                    return {"success": False, "error": "status_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "status_id is required for get action")
                 
                 status = client.status_labels.get(status_id)
                 return {"success": True, "data": status}
@@ -2686,9 +2426,9 @@ def manage_status_labels(
             
             elif action == "update":
                 if not status_id:
-                    return {"success": False, "error": "status_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "status_id is required for update action")
                 if not status_data:
-                    return {"success": False, "error": "status_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "status_data is required for update action")
                 
                 data = status_data.model_dump(exclude_none=True)
                 status = client.status_labels.update(status_id, **data)
@@ -2700,7 +2440,7 @@ def manage_status_labels(
             
             elif action == "delete":
                 if not status_id:
-                    return {"success": False, "error": "status_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "status_id is required for delete action")
                 
                 client.status_labels.delete(status_id)
                 return {
@@ -2710,10 +2450,10 @@ def manage_status_labels(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_status_labels: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_status_labels: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2751,7 +2491,7 @@ def manage_suppliers(
         with client:
             if action == "create":
                 if not supplier_data:
-                    return {"success": False, "error": "supplier_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "supplier_data is required for create action")
                 
                 data = supplier_data.model_dump(exclude_none=True)
                 supplier = client.suppliers.create(**data)
@@ -2766,7 +2506,7 @@ def manage_suppliers(
             
             elif action == "get":
                 if not supplier_id:
-                    return {"success": False, "error": "supplier_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "supplier_id is required for get action")
                 
                 supplier = client.suppliers.get(supplier_id)
                 return {"success": True, "data": supplier}
@@ -2789,9 +2529,9 @@ def manage_suppliers(
             
             elif action == "update":
                 if not supplier_id:
-                    return {"success": False, "error": "supplier_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "supplier_id is required for update action")
                 if not supplier_data:
-                    return {"success": False, "error": "supplier_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "supplier_data is required for update action")
                 
                 data = supplier_data.model_dump(exclude_none=True)
                 supplier = client.suppliers.update(supplier_id, **data)
@@ -2803,7 +2543,7 @@ def manage_suppliers(
             
             elif action == "delete":
                 if not supplier_id:
-                    return {"success": False, "error": "supplier_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "supplier_id is required for delete action")
                 
                 client.suppliers.delete(supplier_id)
                 return {
@@ -2813,10 +2553,10 @@ def manage_suppliers(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_suppliers: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_suppliers: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
@@ -2839,10 +2579,7 @@ def _prepare_user_payload(user_data: UserData, *, require_create: bool = False) 
         if not ldap and not data.get("password"):
             missing.append("password")
         if missing:
-            return {
-                "success": False,
-                "error": f"Missing required fields for create: {', '.join(missing)}",
-            }
+            return _error("MISSING_PARAMETER", f"Missing required fields for create: {', '.join(missing)}")
     return data
 
 
@@ -2897,7 +2634,7 @@ def manage_users(
         with client:
             if action == "create":
                 if not user_data:
-                    return {"success": False, "error": "user_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "user_data is required for create action")
 
                 prepared = _prepare_user_payload(user_data, require_create=True)
                 if prepared.get("success") is False:
@@ -2906,7 +2643,7 @@ def manage_users(
 
                 username = data.pop("username", None)
                 if not username and not data.get("ldap_import"):
-                    return {"success": False, "error": "username is required for create action"}
+                    return _error("MISSING_PARAMETER", "username is required for create action")
 
                 if username:
                     user = client.users.create(username=username, **data)
@@ -2928,7 +2665,7 @@ def manage_users(
 
             elif action == "get":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for get action")
 
                 user = client.users.get(user_id)
                 return {"success": True, "data": user}
@@ -2951,9 +2688,9 @@ def manage_users(
 
             elif action == "update":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for update action")
                 if not user_data:
-                    return {"success": False, "error": "user_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "user_data is required for update action")
 
                 data = _prepare_user_payload(user_data, require_create=False)
                 user = client.users.update(user_id, **data)
@@ -2965,7 +2702,7 @@ def manage_users(
 
             elif action == "delete":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for delete action")
 
                 client.users.delete(user_id)
                 return {
@@ -2975,7 +2712,7 @@ def manage_users(
 
             elif action == "restore":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for restore action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for restore action")
                 result = client._request("POST", f"users/{user_id}/restore")
                 return {"success": True, "data": result, "message": f"User {user_id} restored successfully"}
 
@@ -2992,25 +2729,25 @@ def manage_users(
 
             elif action == "assets":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for assets action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for assets action")
                 result = client._request("GET", f"users/{user_id}/assets")
                 return {"success": True, "data": result}
 
             elif action == "accessories":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for accessories action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for accessories action")
                 result = client._request("GET", f"users/{user_id}/accessories")
                 return {"success": True, "data": result}
 
             elif action == "licenses":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for licenses action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for licenses action")
                 result = client._request("GET", f"users/{user_id}/licenses")
                 return {"success": True, "data": result}
 
             elif action == "history":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for history action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for history action")
                 params = {}
                 if limit is not None:
                     params["limit"] = limit
@@ -3021,13 +2758,13 @@ def manage_users(
 
             elif action == "email_inventory":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for email_inventory action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for email_inventory action")
                 result = client._request("POST", f"users/{user_id}/email")
                 return {"success": True, "data": result}
 
             elif action == "two_factor_reset":
                 if not user_id:
-                    return {"success": False, "error": "user_id is required for two_factor_reset action"}
+                    return _error("MISSING_PARAMETER", "user_id is required for two_factor_reset action")
                 result = client._request("POST", "users/two_factor_reset", json={"id": user_id})
                 return {"success": True, "data": result}
 
@@ -3038,14 +2775,14 @@ def manage_users(
                 result = client._request("POST", "users/ldapsync", json=payload)
                 return {"success": True, "data": result}
 
-            return {"success": False, "error": f"Unknown action: {action}"}
+            return _error("INVALID_ACTION", f"Unknown action: {action}")
 
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_users: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_users: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3076,7 +2813,7 @@ async def manage_components(
         with get_snipeit_client() as snipe:
             if action == "create":
                 if not component_data:
-                    return {"success": False, "error": "component_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "component_data is required for create action")
                 
                 payload = {k: v for k, v in component_data.model_dump().items() if v is not None}
                 result = snipe.components.create(**payload)
@@ -3084,7 +2821,7 @@ async def manage_components(
             
             elif action == "get":
                 if not component_id:
-                    return {"success": False, "error": "component_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "component_id is required for get action")
                 
                 result = snipe.components.get(component_id)
                 return {"success": True, "data": result}
@@ -3103,9 +2840,9 @@ async def manage_components(
             
             elif action == "update":
                 if not component_id:
-                    return {"success": False, "error": "component_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "component_id is required for update action")
                 if not component_data:
-                    return {"success": False, "error": "component_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "component_data is required for update action")
                 
                 payload = {k: v for k, v in component_data.model_dump().items() if v is not None}
                 result = snipe.components.update(component_id, **payload)
@@ -3113,7 +2850,7 @@ async def manage_components(
             
             elif action == "delete":
                 if not component_id:
-                    return {"success": False, "error": "component_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "component_id is required for delete action")
                 
                 snipe.components.delete(component_id)
                 return {
@@ -3123,10 +2860,10 @@ async def manage_components(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_components: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_components: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3151,9 +2888,9 @@ async def component_operations(
         with get_snipeit_client() as snipe:
             if action == "checkout":
                 if not asset_id:
-                    return {"success": False, "error": "asset_id is required for checkout"}
+                    return _error("MISSING_PARAMETER", "asset_id is required for checkout")
                 if not assigned_qty:
-                    return {"success": False, "error": "assigned_qty is required for checkout"}
+                    return _error("MISSING_PARAMETER", "assigned_qty is required for checkout")
                 
                 payload = {
                     "assigned_asset": asset_id,
@@ -3168,7 +2905,7 @@ async def component_operations(
             
             elif action == "checkin":
                 if not asset_id:
-                    return {"success": False, "error": "asset_id is required for checkin"}
+                    return _error("MISSING_PARAMETER", "asset_id is required for checkin")
                 
                 payload = {"asset_id": asset_id}
                 if note:
@@ -3180,10 +2917,10 @@ async def component_operations(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in component_operations: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in component_operations: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3214,7 +2951,7 @@ async def manage_departments(
         with get_snipeit_client() as snipe:
             if action == "create":
                 if not department_data:
-                    return {"success": False, "error": "department_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "department_data is required for create action")
                 
                 payload = {k: v for k, v in department_data.model_dump().items() if v is not None}
                 result = snipe.departments.create(**payload)
@@ -3222,7 +2959,7 @@ async def manage_departments(
             
             elif action == "get":
                 if not department_id:
-                    return {"success": False, "error": "department_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "department_id is required for get action")
                 
                 result = snipe.departments.get(department_id)
                 return {"success": True, "data": result}
@@ -3241,9 +2978,9 @@ async def manage_departments(
             
             elif action == "update":
                 if not department_id:
-                    return {"success": False, "error": "department_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "department_id is required for update action")
                 if not department_data:
-                    return {"success": False, "error": "department_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "department_data is required for update action")
                 
                 payload = {k: v for k, v in department_data.model_dump().items() if v is not None}
                 result = snipe.departments.update(department_id, **payload)
@@ -3251,7 +2988,7 @@ async def manage_departments(
             
             elif action == "delete":
                 if not department_id:
-                    return {"success": False, "error": "department_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "department_id is required for delete action")
                 
                 snipe.departments.delete(department_id)
                 return {
@@ -3261,10 +2998,10 @@ async def manage_departments(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_departments: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_departments: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3296,7 +3033,7 @@ async def manage_custom_fields(
         with get_snipeit_client() as snipe:
             if action == "create":
                 if not field_data:
-                    return {"success": False, "error": "field_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "field_data is required for create action")
                 
                 payload = {k: v for k, v in field_data.model_dump().items() if v is not None}
                 result = snipe.fields.create(**payload)
@@ -3304,7 +3041,7 @@ async def manage_custom_fields(
             
             elif action == "get":
                 if not field_id:
-                    return {"success": False, "error": "field_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "field_id is required for get action")
                 
                 result = snipe.fields.get(field_id)
                 return {"success": True, "data": result}
@@ -3323,9 +3060,9 @@ async def manage_custom_fields(
             
             elif action == "update":
                 if not field_id:
-                    return {"success": False, "error": "field_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "field_id is required for update action")
                 if not field_data:
-                    return {"success": False, "error": "field_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "field_data is required for update action")
                 
                 payload = {k: v for k, v in field_data.model_dump().items() if v is not None}
                 result = snipe.fields.update(field_id, **payload)
@@ -3333,7 +3070,7 @@ async def manage_custom_fields(
             
             elif action == "delete":
                 if not field_id:
-                    return {"success": False, "error": "field_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "field_id is required for delete action")
                 
                 snipe.fields.delete(field_id)
                 return {
@@ -3343,10 +3080,10 @@ async def manage_custom_fields(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_custom_fields: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_custom_fields: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3376,7 +3113,7 @@ async def manage_fieldsets(
         with get_snipeit_client() as snipe:
             if action == "create":
                 if not fieldset_data:
-                    return {"success": False, "error": "fieldset_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "fieldset_data is required for create action")
                 
                 payload = {k: v for k, v in fieldset_data.model_dump().items() if v is not None}
                 result = snipe.fieldsets.create(**payload)
@@ -3384,7 +3121,7 @@ async def manage_fieldsets(
             
             elif action == "get":
                 if not fieldset_id:
-                    return {"success": False, "error": "fieldset_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "fieldset_id is required for get action")
                 
                 result = snipe.fieldsets.get(fieldset_id)
                 return {"success": True, "data": result}
@@ -3401,9 +3138,9 @@ async def manage_fieldsets(
             
             elif action == "update":
                 if not fieldset_id:
-                    return {"success": False, "error": "fieldset_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "fieldset_id is required for update action")
                 if not fieldset_data:
-                    return {"success": False, "error": "fieldset_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "fieldset_data is required for update action")
                 
                 payload = {k: v for k, v in fieldset_data.model_dump().items() if v is not None}
                 result = snipe.fieldsets.update(fieldset_id, **payload)
@@ -3411,7 +3148,7 @@ async def manage_fieldsets(
             
             elif action == "delete":
                 if not fieldset_id:
-                    return {"success": False, "error": "fieldset_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "fieldset_id is required for delete action")
                 
                 snipe.fieldsets.delete(fieldset_id)
                 return {
@@ -3421,10 +3158,10 @@ async def manage_fieldsets(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_fieldsets: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_fieldsets: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3463,10 +3200,10 @@ async def fieldset_field_operations(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in fieldset_field_operations: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in fieldset_field_operations: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # DISABLED: Groups endpoint not available in snipeit-python-api library
@@ -3497,7 +3234,7 @@ async def manage_groups(
         with get_snipeit_client() as snipe:
             if action == "create":
                 if not group_data:
-                    return {"success": False, "error": "group_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "group_data is required for create action")
                 
                 payload = {k: v for k, v in group_data.model_dump().items() if v is not None}
                 result = snipe._request("POST", "groups", json=payload)
@@ -3505,7 +3242,7 @@ async def manage_groups(
             
             elif action == "get":
                 if not group_id:
-                    return {"success": False, "error": "group_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "group_id is required for get action")
                 
                 result = snipe._request("GET", f"groups/{group_id}")
                 return {"success": True, "data": result}
@@ -3522,9 +3259,9 @@ async def manage_groups(
             
             elif action == "update":
                 if not group_id:
-                    return {"success": False, "error": "group_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "group_id is required for update action")
                 if not group_data:
-                    return {"success": False, "error": "group_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "group_data is required for update action")
                 
                 payload = {k: v for k, v in group_data.model_dump().items() if v is not None}
                 result = snipe._request("PUT", f"groups/{group_id}", json=payload)
@@ -3532,7 +3269,7 @@ async def manage_groups(
             
             elif action == "delete":
                 if not group_id:
-                    return {"success": False, "error": "group_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "group_id is required for delete action")
                 
                 snipe._request("DELETE", f"groups/{group_id}")
                 return {
@@ -3542,10 +3279,10 @@ async def manage_groups(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_groups: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_groups: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3577,14 +3314,14 @@ async def account_profile(
                 result = snipe._request("GET", "account/requestable/hardware")
                 return {"success": True, "data": result}
 
-            return {"success": False, "error": f"Unknown action: {action}"}
+            return _error("INVALID_ACTION", f"Unknown action: {action}")
 
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in account_profile: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in account_profile: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3617,10 +3354,10 @@ async def lookup_assets(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in lookup_assets: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in lookup_assets: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3654,7 +3391,7 @@ async def checkout_by_tag(
             search_result = snipe.assets.search(search=asset_tag, search_in_asset_tag=True)
             
             if not search_result or not search_result.get("rows"):
-                return {"success": False, "error": f"Asset with tag '{asset_tag}' not found"}
+                return _error("NOT_FOUND", f"Asset with tag '{asset_tag}' not found")
             
             asset_id = search_result["rows"][0]["id"]
             
@@ -3677,10 +3414,10 @@ async def checkout_by_tag(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in checkout_by_tag: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in checkout_by_tag: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3710,7 +3447,7 @@ async def manage_depreciations(
         with get_snipeit_client() as snipe:
             if action == "create":
                 if not depreciation_data:
-                    return {"success": False, "error": "depreciation_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "depreciation_data is required for create action")
                 
                 payload = {k: v for k, v in depreciation_data.model_dump().items() if v is not None}
                 result = snipe._request("POST", "depreciations", json=payload)
@@ -3718,7 +3455,7 @@ async def manage_depreciations(
             
             elif action == "get":
                 if not depreciation_id:
-                    return {"success": False, "error": "depreciation_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "depreciation_id is required for get action")
                 
                 result = snipe._request("GET", f"depreciations/{depreciation_id}")
                 return {"success": True, "data": result}
@@ -3735,9 +3472,9 @@ async def manage_depreciations(
             
             elif action == "update":
                 if not depreciation_id:
-                    return {"success": False, "error": "depreciation_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "depreciation_id is required for update action")
                 if not depreciation_data:
-                    return {"success": False, "error": "depreciation_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "depreciation_data is required for update action")
                 
                 payload = {k: v for k, v in depreciation_data.model_dump().items() if v is not None}
                 result = snipe._request("PUT", f"depreciations/{depreciation_id}", json=payload)
@@ -3745,7 +3482,7 @@ async def manage_depreciations(
             
             elif action == "delete":
                 if not depreciation_id:
-                    return {"success": False, "error": "depreciation_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "depreciation_id is required for delete action")
                 
                 snipe._request("DELETE", f"depreciations/{depreciation_id}")
                 return {
@@ -3755,10 +3492,10 @@ async def manage_depreciations(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_depreciations: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_depreciations: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3786,7 +3523,7 @@ async def manage_kits(
         with get_snipeit_client() as snipe:
             if action == "create":
                 if not kit_data:
-                    return {"success": False, "error": "kit_data is required for create action"}
+                    return _error("MISSING_PARAMETER", "kit_data is required for create action")
                 
                 payload = {k: v for k, v in kit_data.model_dump().items() if v is not None}
                 result = snipe._request("POST", "kits", json=payload)
@@ -3794,7 +3531,7 @@ async def manage_kits(
             
             elif action == "get":
                 if not kit_id:
-                    return {"success": False, "error": "kit_id is required for get action"}
+                    return _error("MISSING_PARAMETER", "kit_id is required for get action")
                 
                 result = snipe._request("GET", f"kits/{kit_id}")
                 return {"success": True, "data": result}
@@ -3806,9 +3543,9 @@ async def manage_kits(
             
             elif action == "update":
                 if not kit_id:
-                    return {"success": False, "error": "kit_id is required for update action"}
+                    return _error("MISSING_PARAMETER", "kit_id is required for update action")
                 if not kit_data:
-                    return {"success": False, "error": "kit_data is required for update action"}
+                    return _error("MISSING_PARAMETER", "kit_data is required for update action")
                 
                 payload = {k: v for k, v in kit_data.model_dump().items() if v is not None}
                 result = snipe._request("PUT", f"kits/{kit_id}", json=payload)
@@ -3816,7 +3553,7 @@ async def manage_kits(
             
             elif action == "delete":
                 if not kit_id:
-                    return {"success": False, "error": "kit_id is required for delete action"}
+                    return _error("MISSING_PARAMETER", "kit_id is required for delete action")
                 
                 snipe._request("DELETE", f"kits/{kit_id}")
                 return {
@@ -3826,10 +3563,10 @@ async def manage_kits(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in manage_kits: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in manage_kits: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3858,10 +3595,10 @@ async def reports(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in reports: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in reports: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 @mcp.tool()
@@ -3895,10 +3632,10 @@ async def system_settings(
     
     except SnipeITException as e:
         logger.error(f"Snipe-IT error in system_settings: {e}")
-        return {"success": False, "error": str(e)}
+        return _error("API_ERROR", str(e))
     except Exception as e:
         logger.error(f"Error in system_settings: {e}", exc_info=True)
-        return {"success": False, "error": f"Unexpected error: {str(e)}"}
+        return _error("UNEXPECTED_ERROR", f"Unexpected error: {str(e)}")
 
 
 # ============================================================================
