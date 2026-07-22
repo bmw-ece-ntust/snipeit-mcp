@@ -9,7 +9,7 @@ import logging
 import re
 from typing import Literal, Annotated, Any, Optional
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from fastmcp import FastMCP
 from snipeit import SnipeIT
@@ -66,6 +66,24 @@ def get_snipeit_client() -> SnipeIT:
 # Pydantic Models for Tool Input/Output
 # ============================================================================
 
+def _normalize_choice(value: str | None, valid_choices: list[str], field_name: str) -> str | None:
+    """Case/whitespace-insensitively resolve `value` to its canonical entry in `valid_choices`.
+
+    Snipe-IT's enum-like fields (category_type, status type, custom field element/format, ...)
+    are case-sensitive on the API side, but an LLM caller will often supply a differently-cased
+    or title-cased variant (e.g. "Asset" instead of "asset"). Normalizing here means the tool
+    schema still advertises the exact expected values (via Literal) while still accepting the
+    obvious near-misses instead of round-tripping a cryptic API validation error.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    for canonical in valid_choices:
+        if stripped.lower() == canonical.lower():
+            return canonical
+    raise ValueError(f"Invalid {field_name} '{value}'. Must be one of: {', '.join(valid_choices)}")
+
+
 class AssetData(BaseModel):
     """Model for asset data used in create/update operations."""
     status_id: int | None = Field(None, description="ID of the status label")
@@ -88,14 +106,21 @@ class AssetData(BaseModel):
 class CheckoutData(BaseModel):
     """Model for asset checkout operations."""
     checkout_to_type: Literal["user", "asset", "location"] = Field(
-        ..., 
-        description="Type of entity to checkout to"
+        ...,
+        description="Type of entity to checkout to. Must be exactly one of: user, asset, location."
     )
     assigned_to_id: int = Field(..., description="ID of the user/asset/location")
     expected_checkin: str | None = Field(None, description="Expected checkin date (YYYY-MM-DD)")
     checkout_at: str | None = Field(None, description="Checkout date (YYYY-MM-DD)")
     note: str | None = Field(None, description="Checkout notes")
     name: str | None = Field(None, description="Name for the checkout")
+
+    @field_validator("checkout_to_type", mode="before")
+    @classmethod
+    def _normalize_checkout_to_type(cls, v):
+        if isinstance(v, str):
+            return _normalize_choice(v, ["user", "asset", "location"], "checkout_to_type")
+        return v
 
 
 class CheckinData(BaseModel):
@@ -188,14 +213,31 @@ class AccessoryData(BaseModel):
     supplier_id: int | None = Field(None, description="Supplier ID")
 
 
+CATEGORY_TYPES = ["asset", "accessory", "consumable", "component", "license"]
+
+
 class CategoryData(BaseModel):
     """Model for category data."""
     name: str | None = Field(None, description="Category name")
-    category_type: str | None = Field(None, description="Category type: asset, accessory, consumable, component, license")
+    category_type: Literal["asset", "accessory", "consumable", "component", "license"] | None = Field(
+        None,
+        description=(
+            "Category type — which kind of item this category can be assigned to. "
+            "Must be exactly one of (lowercase): asset, accessory, consumable, component, license. "
+            "Required when creating a category; cannot be changed once the category is created."
+        )
+    )
     eula_text: str | None = Field(None, description="EULA text")
     use_default_eula: bool | None = Field(None, description="Use default EULA")
     require_acceptance: bool | None = Field(None, description="Require acceptance")
     checkin_email: bool | None = Field(None, description="Send checkin email")
+
+    @field_validator("category_type", mode="before")
+    @classmethod
+    def _normalize_category_type(cls, v):
+        if isinstance(v, str):
+            return _normalize_choice(v, CATEGORY_TYPES, "category_type")
+        return v
 
 
 class CompanyData(BaseModel):
@@ -259,14 +301,32 @@ class ModelData(BaseModel):
     depreciation_id: int | None = Field(None, description="Depreciation ID")
 
 
+STATUS_LABEL_TYPES = ["deployable", "pending", "undeployable", "archived"]
+
+
 class StatusLabelData(BaseModel):
     """Model for status label data."""
     name: str | None = Field(None, description="Status label name")
-    type: str | None = Field(None, description="Status type: deployable, pending, undeployable, archived")
+    type: Literal["deployable", "pending", "undeployable", "archived"] | None = Field(
+        None,
+        description=(
+            "Status type — controls whether assets with this label can be checked out. "
+            "Must be exactly one of (lowercase): deployable (can be checked out), "
+            "pending (not yet ready), undeployable (broken/lost/needs repair), "
+            "archived (retired, hidden from most views). Required when creating a status label."
+        )
+    )
     color: str | None = Field(None, description="Color hex code")
     show_in_nav: bool | None = Field(None, description="Show in navigation")
     default_label: bool | None = Field(None, description="Default label")
     notes: str | None = Field(None, description="Notes")
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _normalize_type(cls, v):
+        if isinstance(v, str):
+            return _normalize_choice(v, STATUS_LABEL_TYPES, "type")
+        return v
 
 
 class SupplierData(BaseModel):
@@ -351,16 +411,55 @@ class DepartmentData(BaseModel):
     notes: str | None = Field(None, description="Notes")
 
 
+CUSTOM_FIELD_ELEMENTS = ["text", "listbox", "textarea", "markdown-textarea", "checkbox", "radio"]
+CUSTOM_FIELD_FORMATS = [
+    "ANY", "CUSTOM REGEX", "ALPHA", "ALPHA-DASH", "NUMERIC", "ALPHA-NUMERIC",
+    "EMAIL", "DATE", "URL", "IP", "IPV4", "IPV6", "MAC", "BOOLEAN",
+]
+
+
 class CustomFieldData(BaseModel):
     """Model for custom field data."""
     name: str | None = Field(None, description="Field name")
-    element: str | None = Field(None, description="Field type: text, listbox, textarea, checkbox, radio")
-    field_values: str | None = Field(None, description="Pipe-separated values for listbox/radio")
-    format: str | None = Field(None, description="Format: ANY, CUSTOM REGEX, URL, EMAIL, etc.")
-    custom_format: str | None = Field(None, description="Custom regex pattern if format=CUSTOM REGEX")
+    element: Literal["text", "listbox", "textarea", "markdown-textarea", "checkbox", "radio"] | None = Field(
+        None,
+        description=(
+            "Field input type. Must be exactly one of (lowercase): text, listbox, textarea, "
+            "markdown-textarea, checkbox, radio. Use listbox/radio with field_values for a "
+            "fixed set of options. Required when creating a custom field."
+        )
+    )
+    field_values: str | None = Field(None, description="Pipe-separated values for listbox/radio, e.g. 'Option A|Option B|Option C'")
+    format: Literal[
+        "ANY", "CUSTOM REGEX", "ALPHA", "ALPHA-DASH", "NUMERIC", "ALPHA-NUMERIC",
+        "EMAIL", "DATE", "URL", "IP", "IPV4", "IPV6", "MAC", "BOOLEAN",
+    ] | None = Field(
+        None,
+        description=(
+            "Predefined validation format for the field's value. Must be exactly one of "
+            "(uppercase): ANY, CUSTOM REGEX, ALPHA, ALPHA-DASH, NUMERIC, ALPHA-NUMERIC, EMAIL, "
+            "DATE, URL, IP, IPV4, IPV6, MAC, BOOLEAN. Use 'CUSTOM REGEX' together with "
+            "custom_format to supply your own regex pattern."
+        )
+    )
+    custom_format: str | None = Field(None, description="Custom regex pattern, only used when format='CUSTOM REGEX'")
     field_encrypted: bool | None = Field(None, description="Whether field is encrypted")
     help_text: str | None = Field(None, description="Help text")
     show_in_email: bool | None = Field(None, description="Show in email notifications")
+
+    @field_validator("element", mode="before")
+    @classmethod
+    def _normalize_element(cls, v):
+        if isinstance(v, str):
+            return _normalize_choice(v, CUSTOM_FIELD_ELEMENTS, "element")
+        return v
+
+    @field_validator("format", mode="before")
+    @classmethod
+    def _normalize_format(cls, v):
+        if isinstance(v, str):
+            return _normalize_choice(v, CUSTOM_FIELD_FORMATS, "format")
+        return v
 
 
 class FieldsetData(BaseModel):
@@ -1837,7 +1936,8 @@ def accessory_operations(
     description="""Manage Snipe-IT categories with CRUD operations.
     
     Operations:
-    - create: Create a new category (requires category_data with name and category_type)
+    - create: Create a new category (requires category_data with name and category_type;
+      category_type must be one of: asset, accessory, consumable, component, license)
     - get: Retrieve a single category by ID
     - list: List categories with optional pagination and filtering
     - update: Update an existing category (requires category_id and category_data)
@@ -2520,7 +2620,8 @@ def manage_models(
     description="""Manage Snipe-IT status labels with CRUD operations.
     
     Operations:
-    - create: Create a new status label (requires status_data with name and type)
+    - create: Create a new status label (requires status_data with name and type;
+      type must be one of: deployable, pending, undeployable, archived)
     - get: Retrieve a single status label by ID
     - list: List status labels with optional pagination and filtering
     - update: Update an existing status label (requires status_id and status_data)
@@ -3181,7 +3282,8 @@ async def manage_custom_fields(
     Manage Snipe-IT custom fields with CRUD operations.
     
     This tool handles all basic custom field operations:
-    - create: Create a new custom field (requires field_data with name and element)
+    - create: Create a new custom field (requires field_data with name and element;
+      element must be one of: text, listbox, textarea, markdown-textarea, checkbox, radio)
     - get: Retrieve a single custom field by ID
     - list: List custom fields with optional pagination and filtering
     - update: Update an existing custom field (requires field_id and field_data)

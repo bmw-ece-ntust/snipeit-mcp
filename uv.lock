@@ -2246,7 +2246,7 @@ wheels = [
 [[package]]
 name = "snipeit-api"
 version = "0.5.0"
-source = { git = "https://github.com/lfctech/snipeit-python-api.git?rev=main#ce46003fce275f3d5ced05312af29042382e0404" }
+source = { git = "https://github.com/lfctech/snipeit-python-api.git?rev=ce46003#ce46003fce275f3d5ced05312af29042382e0404" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
@@ -2286,7 +2286,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "shapely", specifier = ">=2.0.0" },
-    { name = "snipeit-api", git = "https://github.com/lfctech/snipeit-python-api.git?rev=main" },
+    { name = "snipeit-api", git = "https://github.com/lfctech/snipeit-python-api.git?rev=ce46003" },
     { name = "tqdm", specifier = ">=4.66.0" },
 ]
 
